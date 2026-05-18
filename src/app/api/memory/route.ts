@@ -5,7 +5,7 @@ import { memoryCache } from "@/lib/memory/cache";
 import { MemoryType } from "@/lib/memory/types";
 import { parsePaginationParams, buildPaginatedResponse } from "@/shared/types/pagination";
 import { z } from "zod";
-import { validateBody, isValidationFailure } from "@/shared/validation/helpers";
+import { validateBody, isValidationFailure, getValidationError } from "@/shared/validation/helpers";
 
 const createMemorySchema = z.object({
   content: z.string().min(1),
@@ -91,7 +91,7 @@ export async function POST(request: Request) {
     const rawBody = await request.json();
     const validation = validateBody(createMemorySchema, rawBody);
     if (isValidationFailure(validation)) {
-      return NextResponse.json(validation.error, { status: 400 });
+      return NextResponse.json(getValidationError(validation), { status: 400 });
     }
     const memoryId = await createMemory(validation.data);
     return NextResponse.json({ success: true, id: memoryId });

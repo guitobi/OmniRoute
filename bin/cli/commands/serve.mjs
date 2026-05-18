@@ -20,6 +20,7 @@ function parsePort(value, fallback) {
 export function registerServe(program) {
   program
     .command("serve", { isDefault: true })
+    .alias("launch")
     .description(t("serve.description"))
     .option("--port <port>", t("serve.port"), "20128")
     .option("--no-open", t("serve.no_open"))
