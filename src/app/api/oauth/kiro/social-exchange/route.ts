@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { KiroService } from "@/lib/oauth/services/kiro";
 import { createProviderConnection, isCloudEnabled } from "@/models";
+import { updateProviderConnection, getProviderConnections } from "@/lib/db/providers";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
 import { syncToCloud } from "@/lib/cloudSync";
 import { kiroSocialExchangeSchema } from "@/shared/validation/schemas";
@@ -37,7 +38,10 @@ export async function POST(request: Request) {
     if (isValidationFailure(validation)) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
-    const { code, codeVerifier, provider } = validation.data;
+    const { code, codeVerifier, provider, connectionId } = {
+      ...validation.data,
+      connectionId: rawBody?.connectionId as string | undefined,
+    };
 
     const kiroService = new KiroService();
 
@@ -47,21 +51,35 @@ export async function POST(request: Request) {
     // Extract email from JWT if available
     const email = kiroService.extractEmailFromJWT(tokenData.accessToken);
 
-    // Save to database
-    const connection: any = await createProviderConnection({
-      provider: "kiro",
-      authType: "oauth",
+    const expiresAt = new Date(Date.now() + tokenData.expiresIn * 1000).toISOString();
+    const newData = {
       accessToken: tokenData.accessToken,
       refreshToken: tokenData.refreshToken,
-      expiresAt: new Date(Date.now() + tokenData.expiresIn * 1000).toISOString(),
+      expiresAt,
       email: email || null,
       providerSpecificData: {
         profileArn: tokenData.profileArn,
-        authMethod: provider, // "google" or "github"
+        authMethod: provider,
         provider: provider.charAt(0).toUpperCase() + provider.slice(1),
       },
       testStatus: "active",
-    });
+      isActive: true,
+    };
+
+    // Upsert: update existing connection if connectionId provided or same email exists
+    let connection: any;
+    if (connectionId) {
+      connection = await updateProviderConnection(connectionId, newData);
+    } else if (email) {
+      const existing = await getProviderConnections({ provider: "kiro" });
+      const match = existing.find((c: any) => c.email === email && c.authType === "oauth");
+      if (match?.id) {
+        connection = await updateProviderConnection(match.id, newData);
+      }
+    }
+    if (!connection) {
+      connection = await createProviderConnection({ provider: "kiro", authType: "oauth", ...newData });
+    }
 
     // Auto sync to Cloud if enabled
     await syncToCloudIfEnabled();

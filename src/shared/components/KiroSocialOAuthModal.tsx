@@ -12,6 +12,7 @@ type KiroSocialOAuthModalProps = {
   providerLabel?: string;
   onSuccess?: () => void;
   onClose: () => void;
+  reauthConnection?: null | { id?: string };
 };
 
 /**
@@ -24,6 +25,7 @@ export default function KiroSocialOAuthModal({
   providerLabel = "Kiro",
   onSuccess,
   onClose,
+  reauthConnection,
 }: KiroSocialOAuthModalProps) {
   const [step, setStep] = useState("loading"); // loading | input | success | error
   const [authUrl, setAuthUrl] = useState("");
@@ -96,6 +98,7 @@ export default function KiroSocialOAuthModal({
           code,
           codeVerifier: authData.codeVerifier,
           provider,
+          ...(reauthConnection?.id ? { connectionId: reauthConnection.id } : {}),
         }),
       });
 
