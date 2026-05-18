@@ -262,13 +262,37 @@ export class KiroExecutor extends BaseExecutor {
   }: ExecuteInput) {
     let activeCredentials = credentials;
 
+    // Persist refreshed Kiro credentials to DB so they survive restarts.
+    // onCredentialsRefreshed is absent in combo paths — fall back to direct DB write.
+    const persistRefreshed = async (refreshed: ProviderCredentials) => {
+      if (onCredentialsRefreshed) {
+        await onCredentialsRefreshed(refreshed);
+        return;
+      }
+      const connectionId = credentials?.connectionId;
+      if (!connectionId) return;
+      try {
+        const { updateProviderConnection } = await import("../../src/lib/db/providers.ts");
+        const expiresAt = refreshed.expiresIn
+          ? new Date(Date.now() + (refreshed.expiresIn as number) * 1000).toISOString()
+          : undefined;
+        await updateProviderConnection(connectionId, {
+          ...(refreshed.accessToken ? { accessToken: refreshed.accessToken } : {}),
+          ...(refreshed.refreshToken ? { refreshToken: refreshed.refreshToken } : {}),
+          ...(expiresAt ? { expiresAt, tokenExpiresAt: expiresAt } : {}),
+        });
+      } catch (err) {
+        log?.warn?.("TOKEN", `Kiro DB persist failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    };
+
     // Proactively refresh if token is near expiry
     if (this.needsRefresh(credentials)) {
       try {
         const refreshed = await this.refreshCredentials(credentials, log || null);
         if (refreshed) {
           activeCredentials = { ...credentials, ...refreshed };
-          if (onCredentialsRefreshed) await onCredentialsRefreshed(refreshed);
+          await persistRefreshed(refreshed);
         }
       } catch (err) {
         log?.warn?.(
@@ -322,7 +346,7 @@ export class KiroExecutor extends BaseExecutor {
           const refreshed = await this.refreshCredentials(credentials, log || null);
           if (refreshed) {
             activeCredentials = { ...credentials, ...refreshed };
-            if (onCredentialsRefreshed) await onCredentialsRefreshed(refreshed);
+            await persistRefreshed(refreshed);
             ({ response, url, headers, transformedBody } = await doFetch(activeCredentials));
           }
         } catch (err) {
