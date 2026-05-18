@@ -1,0 +1,32 @@
+{
+  "id": "uk-docker-logs",
+  "label": "Docker Logs (Ukrainian)",
+  "description": "RTK filter tuned for Docker/container logs with Ukrainian error messages.",
+  "category": "generic",
+  "priority": 30,
+  "match": {
+    "outputTypes": ["docker-log", "generic-output"],
+    "commands": ["docker", "docker-compose"],
+    "patterns": ["\u041f\u043e\u043c\u0438\u043b\u043a\u0430", "ERROR", "failed", "FATAL"]
+  },
+  "rules": {
+    "includePatterns": [],
+    "dropPatterns": ["^\\s*$"],
+    "collapsePatterns": ["^\\s*at \\S+\\(.*\\)$"],
+    "deduplicate": true,
+    "maxLines": 200,
+    "headLines": 40,
+    "tailLines": 40
+  },
+  "preserve": {
+    "errorPatterns": ["помилка", "ERROR", "failed", "exception"],
+    "summaryPatterns": []
+  },
+  "tests": [
+    {
+      "name": "uk docker error sample",
+      "input": "Помилка: контейнер не запустився\nstack trace line 1\nstack trace line 2",
+      "expected": "Помилка: контейнер не запустився\nstack trace line 1\nstack trace line 2"
+    }
+  ]
+}

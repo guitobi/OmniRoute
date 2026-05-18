@@ -479,8 +479,22 @@ export function cavemanCompress(
   validationWarnings.push(...customPreservation.warnings);
 
   const compressedMessages = body.messages.map((msg): ChatMessage => {
+    // Skip non-text content (preserves structured tool blocks)
     if (typeof msg.content !== "string" && !Array.isArray(msg.content)) {
       return msg;
+    }
+
+    // If the message contains tool-related blocks (tool_result/tool_use/tool_call)
+    // do not apply Caveman compression to avoid breaking downstream translators
+    if (Array.isArray(msg.content)) {
+      for (const part of msg.content) {
+        if (part && typeof part === "object" && typeof part.type === "string") {
+          const t = part.type.toLowerCase();
+          if (t === "tool_result" || t === "tool_use" || t === "tool_call") {
+            return msg;
+          }
+        }
+      }
     }
 
     const contentStr =

@@ -20,6 +20,22 @@ import {
   type CachingDetectionContext,
 } from "./cachingAware.ts";
 
+const COMPRESSION_BYPASS_PROVIDERS = new Set(["kiro", "amazon-q"]);
+
+export function shouldBypassCompressionForProvider(
+  provider?: string | null,
+  targetFormat?: string | null
+): boolean {
+  const normalizedProvider = typeof provider === "string" ? provider.trim().toLowerCase() : "";
+  const normalizedTargetFormat =
+    typeof targetFormat === "string" ? targetFormat.trim().toLowerCase() : "";
+
+  return (
+    COMPRESSION_BYPASS_PROVIDERS.has(normalizedProvider) ||
+    COMPRESSION_BYPASS_PROVIDERS.has(normalizedTargetFormat)
+  );
+}
+
 export function checkComboOverride(
   config: CompressionConfig,
   comboId: string | null
@@ -59,6 +75,9 @@ export function selectCompressionStrategy(
   // Apply caching-aware adjustments if body is provided
   if (body) {
     const ctx = detectCachingContext(body, context);
+    if (shouldBypassCompressionForProvider(ctx.provider, ctx.targetFormat)) {
+      return "off";
+    }
     const cacheAware = getCacheAwareStrategy(selectedMode, ctx);
     return cacheAware.strategy as CompressionMode;
   }

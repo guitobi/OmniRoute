@@ -1,0 +1,32 @@
+{
+  "id": "uk-git-log",
+  "label": "Git Logs (Ukrainian)",
+  "description": "RTK filter for git command outputs and Ukrainian commit/error messages.",
+  "category": "generic",
+  "priority": 25,
+  "match": {
+    "outputTypes": ["git-output", "generic-output"],
+    "commands": ["git"],
+    "patterns": ["fatal:", "error:", "\u041f\u043e\u043c\u0438\u043b\u043a\u0430"]
+  },
+  "rules": {
+    "includePatterns": [],
+    "dropPatterns": ["^\\s*$"],
+    "collapsePatterns": ["^\\s*On branch .*", "^\\s*Changes not staged for commit:"],
+    "deduplicate": true,
+    "maxLines": 120,
+    "headLines": 30,
+    "tailLines": 40
+  },
+  "preserve": {
+    "errorPatterns": ["fatal", "error", "помилка"],
+    "summaryPatterns": []
+  },
+  "tests": [
+    {
+      "name": "uk git error",
+      "input": "fatal: не вдалося виконати операцію\nerror: failed to push some refs",
+      "expected": "fatal: не вдалося виконати операцію\nerror: failed to push some refs"
+    }
+  ]
+}

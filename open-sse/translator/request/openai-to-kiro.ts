@@ -659,7 +659,23 @@ export function buildKiroPayload(model, body, stream, credentials) {
     /^(claude-(?:opus|sonnet|haiku|3-\d+)-\d+)-(\d+)$/,
     "$1.$2"
   );
-  const messages = body.messages || [];
+
+  // Normalize body.system (Claude-format array or string) into a leading system message
+  // so it is not silently dropped when the caller arrives via the openai→kiro path
+  // (i.e. sourceFormat was already "openai" but the body is actually Claude-shaped).
+  let messages = body.messages || [];
+  if (body.system && !messages.some((m) => m.role === "system")) {
+    const systemText = Array.isArray(body.system)
+      ? body.system
+          .map((b) => (typeof b === "object" && b !== null ? b.text || "" : String(b)))
+          .join("\n")
+      : typeof body.system === "string"
+        ? body.system
+        : "";
+    if (systemText) {
+      messages = [{ role: "system", content: systemText }, ...messages];
+    }
+  }
   let tools = body.tools || [];
   const maxTokens = body.max_tokens ?? body.max_completion_tokens ?? 32000;
   const temperature = body.temperature;

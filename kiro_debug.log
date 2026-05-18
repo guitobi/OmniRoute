@@ -1,0 +1,26 @@
+▲ Next.js 16.2.6
+- Local:         http://localhost:3000
+- Network:       http://0.0.0.0:3000
+✓ Ready in 0ms
+[CREDENTIALS] No external credentials file found, using defaults.
+[DB] Preserved critical DB state before potential recreation: key_value(89), provider_connections(12)
+[DB] SQLite database ready: C:\Users\Administrator\.omniroute\storage.sqlite
+[STARTUP] Global fetch proxy patch initialized
+[HealthCheck] Starting proactive token health-check (tick every 60s)
+[Shutdown] Graceful shutdown handlers registered.
+[STARTUP] Spend batch writer started
+[STARTUP] Guardrail registry initialized
+[STARTUP] Builtin skill handlers registered
+[STARTUP] Quota cache background refresh started
+[ProviderLimitsSync] Scheduler started — interval: 70m
+[STARTUP] Provider limits sync scheduler started
+[ModelSync] Scheduler started — interval: 24h
+[STARTUP] Cloud/model sync background bootstrap initialized
+[BATCH] Initializing batch processor polling...
+[STARTUP] Batch processor started
+[STARTUP] Runtime settings hydrated: payloadRules, modelAliases, backgroundDegradation, cliCompatProviders, cacheControl, usageTracking, healthCheckLogs, thoughtSignature, modelsDevSync, corsOrigins, ccBridgeTransforms, systemTransforms
+[STARTUP] Model alias seed: applied=0, skipped=6, failed=0
+[HOT_RELOAD] Runtime config hot-reload started (poll=5000ms, fsWatch=on)
+[COMPLIANCE] Audit log table initialized
+[proxyLogger] Loaded 200 proxy logs from SQLite
+[ModelSync] No connections with autoSync enabled — skipping cycle

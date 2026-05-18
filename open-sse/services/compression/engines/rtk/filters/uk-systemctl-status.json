@@ -1,0 +1,32 @@
+{
+  "id": "uk-systemctl-status",
+  "label": "systemctl status (Ukr)",
+  "description": "Filter for systemctl/journalctl outputs that include Ukrainian service status messages.",
+  "category": "generic",
+  "priority": 28,
+  "match": {
+    "outputTypes": ["systemctl", "generic-output"],
+    "commands": ["systemctl", "journalctl"],
+    "patterns": ["Active:", "Failed", "Помилка", "не вдалося"]
+  },
+  "rules": {
+    "includePatterns": [],
+    "dropPatterns": ["^\\s*$"],
+    "collapsePatterns": ["^\\s*-\\s+.*$"],
+    "deduplicate": true,
+    "maxLines": 200,
+    "headLines": 30,
+    "tailLines": 50
+  },
+  "preserve": {
+    "errorPatterns": ["Failed", "Помилка", "failed"],
+    "summaryPatterns": []
+  },
+  "tests": [
+    {
+      "name": "uk systemctl failed",
+      "input": "● myservice.service - My Service\n   Loaded: loaded (/etc/systemd/system/myservice.service; enabled; vendor preset: enabled)\n   Active: failed (Result: exit-code) since ...\n   Main PID: 1234 (code=exited, status=1/FAILURE)",
+      "expected": "● myservice.service - My Service\n   Active: failed (Result: exit-code) since ...\n   Main PID: 1234 (code=exited, status=1/FAILURE)"
+    }
+  ]
+}
