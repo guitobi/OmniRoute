@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { KiroService } from "@/lib/oauth/services/kiro";
 import { createProviderConnection, isCloudEnabled, resolveProxyForProvider } from "@/models";
+import { updateProviderConnection, getProviderConnections } from "@/lib/db/providers";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
 import { syncToCloud } from "@/lib/cloudSync";
 import { kiroImportSchema } from "@/shared/validation/schemas";
@@ -45,6 +46,8 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: validation.error }, { status: 400 });
     }
     const { refreshToken, region } = validation.data;
+    const connectionId =
+      typeof rawBody?.connectionId === "string" ? rawBody.connectionId : undefined;
 
     const kiroService = new KiroService();
 
@@ -61,13 +64,11 @@ export async function POST(request: Request) {
     // Extract email from JWT if available
     const email = kiroService.extractEmailFromJWT(tokenData.accessToken);
 
-    // Save to database
-    const connection: any = await createProviderConnection({
-      provider: targetProvider,
-      authType: "oauth",
+    const expiresAt = new Date(Date.now() + tokenData.expiresIn * 1000).toISOString();
+    const newData = {
       accessToken: tokenData.accessToken,
       refreshToken: tokenData.refreshToken,
-      expiresAt: new Date(Date.now() + tokenData.expiresIn * 1000).toISOString(),
+      expiresAt,
       email: email || null,
       providerSpecificData: {
         profileArn: tokenData.profileArn,
@@ -85,7 +86,27 @@ export async function POST(request: Request) {
           : {}),
       },
       testStatus: "active",
-    });
+      isActive: true,
+    };
+
+    // Upsert: update existing connection if connectionId provided or same email exists
+    let connection: any;
+    if (connectionId) {
+      connection = await updateProviderConnection(connectionId, newData);
+    } else if (email) {
+      const existing = await getProviderConnections({ provider: targetProvider });
+      const match = existing.find((c: any) => c.email === email && c.authType === "oauth");
+      if (typeof match?.id === "string") {
+        connection = await updateProviderConnection(match.id, newData);
+      }
+    }
+    if (!connection) {
+      connection = await createProviderConnection({
+        provider: targetProvider,
+        authType: "oauth",
+        ...newData,
+      });
+    }
 
     // Auto sync to Cloud if enabled
     await syncToCloudIfEnabled();

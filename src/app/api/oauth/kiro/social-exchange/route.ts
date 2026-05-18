@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { KiroService } from "@/lib/oauth/services/kiro";
 import { createProviderConnection, isCloudEnabled } from "@/models";
+import { updateProviderConnection, getProviderConnections } from "@/lib/db/providers";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
 import { syncToCloud } from "@/lib/cloudSync";
 import { isAuthRequired, isAuthenticated } from "@/shared/utils/apiAuth";
@@ -71,6 +72,8 @@ export async function POST(request: Request) {
         error: data.error || "no_tokens",
       });
     }
+    const connectionId =
+      typeof rawBody?.connectionId === "string" ? rawBody.connectionId : undefined;
 
     const kiroService = new KiroService();
     const email = kiroService.extractEmailFromJWT(data.accessToken);
@@ -84,16 +87,35 @@ export async function POST(request: Request) {
       providerSpecificData.profileArn = data.profileArn;
     }
 
-    const connection: any = await createProviderConnection({
-      provider: "kiro",
-      authType: "oauth",
+    const expiresAt = new Date(Date.now() + (data.expiresIn || 3600) * 1000).toISOString();
+    const newData = {
       accessToken: data.accessToken,
       refreshToken: data.refreshToken,
-      expiresAt: new Date(Date.now() + (data.expiresIn || 3600) * 1000).toISOString(),
+      expiresAt,
       email: email || null,
       providerSpecificData,
       testStatus: "active",
-    });
+      isActive: true,
+    };
+
+    // Upsert: update existing connection if connectionId provided or same email exists
+    let connection: any;
+    if (connectionId) {
+      connection = await updateProviderConnection(connectionId, newData);
+    } else if (email) {
+      const existing = await getProviderConnections({ provider: "kiro" });
+      const match = existing.find((c: any) => c.email === email && c.authType === "oauth");
+      if (typeof match?.id === "string") {
+        connection = await updateProviderConnection(match.id, newData);
+      }
+    }
+    if (!connection) {
+      connection = await createProviderConnection({
+        provider: "kiro",
+        authType: "oauth",
+        ...newData,
+      });
+    }
 
     await syncToCloudIfEnabled();
 

@@ -10,6 +10,7 @@ type KiroSocialOAuthModalProps = {
   providerLabel?: string;
   onSuccess?: () => void;
   onClose: () => void;
+  reauthConnection?: null | { id?: string };
 };
 
 export default function KiroSocialOAuthModal({
@@ -18,6 +19,7 @@ export default function KiroSocialOAuthModal({
   providerLabel = "Kiro",
   onSuccess,
   onClose,
+  reauthConnection,
 }: KiroSocialOAuthModalProps) {
   const [step, setStep] = useState<"loading" | "polling" | "success" | "error">("loading");
   const [error, setError] = useState<string | null>(null);
@@ -50,7 +52,11 @@ export default function KiroSocialOAuthModal({
             const pollRes = await fetch("/api/oauth/kiro/social-exchange", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ deviceCode: data.deviceCode, provider }),
+              body: JSON.stringify({
+                deviceCode: data.deviceCode,
+                provider,
+                ...(reauthConnection?.id ? { connectionId: reauthConnection.id } : {}),
+              }),
             });
             const pollData = await pollRes.json();
 
@@ -78,7 +84,7 @@ export default function KiroSocialOAuthModal({
         pollRef.current = null;
       }
     };
-  }, [isOpen, provider]);
+  }, [isOpen, provider, reauthConnection?.id, onSuccess]);
 
   const handleClose = () => {
     if (pollRef.current) {

@@ -79,6 +79,7 @@ export default function KiroOAuthWrapper({
         providerLabel={providerLabel}
         onMethodSelect={handleMethodSelect}
         onClose={onClose}
+        reauthConnection={reauthConnection}
       />
     );
   }
@@ -107,6 +108,7 @@ export default function KiroOAuthWrapper({
         providerLabel={providerLabel}
         onSuccess={handleSocialSuccess}
         onClose={handleBack}
+        reauthConnection={reauthConnection}
       />
     );
   }
