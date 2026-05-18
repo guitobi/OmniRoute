@@ -1,0 +1,168 @@
+{
+  "language": "uk",
+  "category": "ultra",
+  "rules": [
+    {
+      "name": "ultra_abbreviations_uk",
+      "pattern": "\\b(конфігурація|функція|файл|повідомлення|запит|відповідь|імплементація|аутентифікація|авторизація|залежність|залежності|сервер|база даних|налаштування)\\b",
+      "flags": "giu",
+      "replacementMap": {
+        "конфігурація": "конф",
+        "функція": "фн",
+        "файл": "файл",
+        "повідомлення": "пов",
+        "запит": "зап",
+        "відповідь": "відп",
+        "імплементація": "імпл",
+        "аутентифікація": "аутх",
+        "авторизація": "аутз",
+        "залежність": "залеж",
+        "залежності": "залеж",
+        "сервер": "srv",
+        "база даних": "БД",
+        "налаштування": "налаш"
+      },
+      "context": "all",
+      "category": "ultra",
+      "minIntensity": "ultra",
+      "description": "Ultra abbreviations for common Ukrainian technical words."
+    },
+    {
+      "name": "leader_phrases_uk",
+      "pattern": "^(?:я можу|я можу запропонувати|дозвольте мені|ми можемо|ви можете)\\s+(?=[а-яіїєґА-ЯІЇЄҐ])",
+      "flags": "giu",
+      "replacement": "",
+      "context": "all",
+      "category": "terse",
+      "minIntensity": "full",
+      "description": "Strip leading offering/leader phrases in Ukrainian."
+    },
+    {
+      "name": "remove_filler_phrases_uk",
+      "pattern": "\\b(?:будь ласка|дякую|спасибі|вдячний|вдячна|вибачте|все одно|взагалі-то|як би|так би мовити|я б дуже вдячний|не могли б ви)\\b[,.!?\\s]*",
+      "flags": "giu",
+      "replacement": "",
+      "context": "all",
+      "category": "filler",
+      "minIntensity": "lite",
+      "description": "Remove common polite and filler phrases in Ukrainian."
+    },
+    {
+      "name": "multiword_collapses_uk",
+      "pattern": "\\b(?:в результаті того що|внаслідок того що|внаслідок|в результаті|з точки зору|на самому ділі|в загальному випадку|в принципі)\\b",
+      "flags": "giu",
+      "replacement": "через ",
+      "context": "all",
+      "category": "terse",
+      "minIntensity": "ultra",
+      "description": "Collapse verbose multiword phrases to shorter equivalents."
+    },
+    {
+      "name": "date_time_number_normalization_uk",
+      "pattern": "\\b(\\d{4}-\\d{2}-\\d{2}|\\d{1,2}[\\./-]\\d{1,2}[\\./-]\\d{2,4}|\\d{1,2}:\\d{2}|\\d{1,3}(?:[ ,]\\d{3})+)\\b",
+      "flags": "g",
+      "replacement": "<num>",
+      "context": "all",
+      "category": "structural",
+      "minIntensity": "full",
+      "description": "Normalize dates, times and large numbers to a short token."
+    },
+    {
+      "name": "multiword_abbrev_uk",
+      "pattern": "\\b(запитувана інформация|запитувана інформація|детальна інструкція|приклади конфігурації|приклади команд)\\b",
+      "flags": "giu",
+      "replacement": "запит",
+      "context": "all",
+      "category": "ultra",
+      "minIntensity": "ultra",
+      "description": "Shorten common multiword technical phrases."
+    },
+    {
+      "name": "shorten_common_terms_uk",
+      "pattern": "\\b(лог|журнал|відомості|інформація|помилка|помилки)\\b",
+      "flags": "giu",
+      "replacementMap": {
+        "лог": "лог",
+        "журнал": "жур",
+        "відомості": "відом",
+        "інформація": "інф",
+        "помилка": "пом",
+        "помилки": "пом"
+      },
+      "context": "all",
+      "category": "ultra",
+      "minIntensity": "ultra",
+      "description": "Abbreviate common single-word technical terms."
+    },
+    {
+      "name": "shorten_urls_emails_uk",
+      "pattern": "(https?:\\\\/\\\\/[^\\\\s]+|\\\\b[\\\\w.+-]+@[\\\\w.-]+\\\\.[a-z]{2,}\\\\b)",
+      "flags": "giu",
+      "replacement": "<link>",
+      "context": "all",
+      "category": "structural",
+      "minIntensity": "full",
+      "description": "Replace long URLs and emails with a short token to save tokens."
+    },
+    {
+      "name": "collapse_repeated_lines_uk",
+      "pattern": "^(\\s*)(.+?)\\s*(?:\\n\\s*\\2\\s*){1,}",
+      "flags": "gimu",
+      "replacement": "$1$2\\n",
+      "context": "all",
+      "category": "dedup",
+      "minIntensity": "ultra",
+      "description": "Collapse adjacent repeated lines into a single occurrence."
+    },
+    {
+      "name": "collapse_excess_punctuation_uk",
+      "pattern": "([!?.]{2,}|[,;:]{2,})",
+      "flags": "g",
+      "replacement": "$1",
+      "context": "all",
+      "category": "ultra",
+      "minIntensity": "lite",
+      "description": "Collapse repeated punctuation sequences."
+    },
+    {
+      "name": "strip_previous_message_prefix_uk",
+      "pattern": "Попередній меседж\\s+\\d+:\\s*",
+      "flags": "giu",
+      "replacement": "",
+      "context": "all",
+      "category": "structural",
+      "minIntensity": "full",
+      "description": "Remove 'Попередній меседж N:' prefixes used in multi-turn context dumps."
+    },
+    {
+      "name": "aggressive_multiword_collapses_uk",
+      "pattern": "\\b(під\\s+час\\s+виконання|в\\s+процесі\\s+виконання|в\\s+результаті\\s+виконання|у\\s+рамках\\s+запиту|для\\s+отримання\\s+інформації|з\\s+метою\\s+отримання)\\b",
+      "flags": "giu",
+      "replacement": "підчас",
+      "context": "all",
+      "category": "ultra",
+      "minIntensity": "ultra",
+      "description": "Collapse long technical prepositional phrases to a short token."
+    },
+    {
+      "name": "strip_parenthetical_explanations_uk",
+      "pattern": "\\([^\\)]{1,200}\\)",
+      "flags": "g",
+      "replacement": "",
+      "context": "all",
+      "category": "terse",
+      "minIntensity": "ultra",
+      "description": "Remove short parenthetical explanatory clauses to save tokens."
+    },
+    {
+      "name": "remove_common_particles_uk",
+      "pattern": "\\b(що|який|яка|яке|які|та|і|аби|б|би|же|бо|також|проте|однак|тому)\\b",
+      "flags": "giu",
+      "replacement": " ",
+      "context": "all",
+      "category": "filler",
+      "minIntensity": "ultra",
+      "description": "Remove common Ukrainian particles and conjunctions to aggressively shorten prose (highly lossy)."
+    }
+  ]
+}

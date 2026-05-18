@@ -6,6 +6,7 @@ import {
   applyCompression,
   checkComboOverride,
   shouldAutoTrigger,
+  shouldBypassCompressionForProvider,
 } from "../../../open-sse/services/compression/strategySelector.ts";
 import type { CompressionConfig } from "../../../open-sse/services/compression/types.ts";
 
@@ -110,6 +111,22 @@ describe("selectCompressionStrategy", () => {
     assert.equal(selectCompressionStrategy(baseConfig, null, 100), "lite");
   });
 
+  it("bypasses compression for Kiro-compatible providers", () => {
+    const config = { ...baseConfig, defaultMode: "aggressive" as const };
+    const body = {
+      messages: [{ role: "user", content: "keep this intact" }],
+    };
+
+    assert.equal(
+      selectCompressionStrategy(config, null, 100, body, {
+        provider: "kiro",
+        targetFormat: "kiro",
+        model: "claude-sonnet-4.6",
+      }),
+      "off"
+    );
+  });
+
   it("downgrades aggressive cache-control requests for caching-aware providers", () => {
     const config = { ...baseConfig, defaultMode: "aggressive" as const };
     const body = {
@@ -129,6 +146,18 @@ describe("selectCompressionStrategy", () => {
       }),
       "standard"
     );
+  });
+});
+
+describe("shouldBypassCompressionForProvider", () => {
+  it("returns true for kiro and amazon-q provider ids", () => {
+    assert.equal(shouldBypassCompressionForProvider("kiro", null), true);
+    assert.equal(shouldBypassCompressionForProvider("amazon-q", null), true);
+    assert.equal(shouldBypassCompressionForProvider(null, "kiro"), true);
+  });
+
+  it("returns false for unrelated providers", () => {
+    assert.equal(shouldBypassCompressionForProvider("anthropic", "claude"), false);
   });
 });
 

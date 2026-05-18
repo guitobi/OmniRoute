@@ -1,0 +1,51 @@
+{
+  "language": "ru",
+  "category": "filler",
+  "rules": [
+    {
+      "name": "pleasantries",
+      "pattern": "(?<!\")\\b(?:спасибо|благодарю|заранее спасибо|не за что|рад помочь|приятно|пожалуйста)\\b[,.!?\\s]*",
+      "replacement": "",
+      "context": "all",
+      "category": "filler",
+      "minIntensity": "lite",
+      "description": "Drop common polite expressions in Russian/Ukrainian-style Cyrillic text."
+    },
+    {
+      "name": "polite_framing",
+      "pattern": "\\b(?:не могли бы вы|могли бы вы|прошу вас|будьте добры)\\b\\s*",
+      "replacement": "",
+      "context": "user",
+      "category": "filler",
+      "minIntensity": "lite",
+      "description": "Remove polite framing that doesn't change intent."
+    },
+    {
+      "name": "hedging",
+      "pattern": "\\b(?:кажется|возможно|вероятно|может быть|я думаю|я полагаю|мне кажется)\\b\\s*",
+      "replacement": "",
+      "context": "all",
+      "category": "filler",
+      "minIntensity": "lite",
+      "description": "Remove hedging words in Cyrillic prose."
+    },
+    {
+      "name": "redundant_openers",
+      "pattern": "^(?:здравствуйте|привет|добрый день|доброе утро|добрый вечер)\\s*[,.!?\\s]?\\s*",
+      "replacement": "",
+      "context": "user",
+      "category": "filler",
+      "minIntensity": "lite",
+      "description": "Strip common greetings from user messages."
+    },
+    {
+      "name": "filler_adverbs",
+      "pattern": "\\b(?:по сути|в основном|фактически|действительно|просто|в настоящее время)\\b\\s*",
+      "replacement": "",
+      "context": "all",
+      "category": "filler",
+      "minIntensity": "lite",
+      "description": "Remove common filler adverbs/phrases in Cyrillic."
+    }
+  ]
+}

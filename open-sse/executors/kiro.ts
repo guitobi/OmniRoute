@@ -179,6 +179,14 @@ export class KiroExecutor extends BaseExecutor {
 
   buildHeaders(credentials: ProviderCredentials, stream = true) {
     void stream;
+    const rawToken = credentials.apiKey || credentials.accessToken || "";
+    const bearerToken =
+      typeof rawToken === "string"
+        ? rawToken
+            .trim()
+            .replace(/^Bearer\s+/i, "")
+            .trim()
+        : "";
     const headers: Record<string, string> = {
       ...this.config.headers,
       "Amz-Sdk-Request": "attempt=1; max=3",
@@ -187,8 +195,24 @@ export class KiroExecutor extends BaseExecutor {
       "anthropic-beta": "prompt-caching-2024-07-31",
     };
 
-    if (credentials.accessToken) {
-      headers["Authorization"] = `Bearer ${credentials.accessToken}`;
+    if (bearerToken) {
+      headers["Authorization"] = `Bearer ${bearerToken}`;
+    }
+
+    // Debug trace: optionally log presence of credentials and Authorization header
+    try {
+      if (process.env.DEBUG_KIRO_TRACE === "1") {
+        const tokenPreview =
+          typeof bearerToken === "string" && bearerToken.length > 8
+            ? `${bearerToken.slice(0, 8)}...(${bearerToken.length})`
+            : String(bearerToken);
+
+        console.debug(
+          `[Kiro][TRACE] buildHeaders: credentialsPresent=${!!credentials}, accessTokenPresent=${!!(credentials && (credentials as any).accessToken)}, apiKeyPresent=${!!(credentials && (credentials as any).apiKey)}, tokenPreview=${tokenPreview}, authorizationHeader=${headers["Authorization"] ? "present" : "missing"}`
+        );
+      }
+    } catch (err) {
+      /* swallow logging errors */
     }
 
     return headers;
@@ -234,18 +258,81 @@ export class KiroExecutor extends BaseExecutor {
     signal,
     log,
     upstreamExtraHeaders,
+    onCredentialsRefreshed,
   }: ExecuteInput) {
-    const url = this.buildUrl(model, stream, 0);
-    const headers = this.buildHeaders(credentials, stream);
-    mergeUpstreamExtraHeaders(headers, upstreamExtraHeaders);
-    const transformedBody = await this.transformRequest(model, body, stream, credentials);
+    let activeCredentials = credentials;
 
-    const response = await fetch(url, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(transformedBody),
-      signal,
-    });
+    // Proactively refresh if token is near expiry
+    if (this.needsRefresh(credentials)) {
+      try {
+        const refreshed = await this.refreshCredentials(credentials, log || null);
+        if (refreshed) {
+          activeCredentials = { ...credentials, ...refreshed };
+          if (onCredentialsRefreshed) await onCredentialsRefreshed(refreshed);
+        }
+      } catch (err) {
+        log?.warn?.(
+          "TOKEN",
+          `Kiro proactive refresh failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
+
+    const doFetch = async (creds: ProviderCredentials) => {
+      const url = this.buildUrl(model, stream, 0);
+      const headers = this.buildHeaders(creds, stream);
+      mergeUpstreamExtraHeaders(headers, upstreamExtraHeaders);
+      try {
+        if (process.env.DEBUG_KIRO_TRACE === "1") {
+          const auth = headers["Authorization"] as string | undefined;
+          const authPreview =
+            auth && auth.length > 12 ? `${auth.slice(0, 12)}...(${auth.length})` : String(auth);
+
+          console.debug(
+            `[Kiro][TRACE] execute: url=${url} credentialsPresent=${!!creds} authorization=${auth ? "present" : "missing"} authPreview=${authPreview}`
+          );
+        }
+      } catch (_err) {
+        /* swallow logging errors */
+      }
+      const transformedBody = await this.transformRequest(model, body, stream, creds);
+      const response = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(transformedBody),
+        signal,
+      });
+      return { response, url, headers, transformedBody };
+    };
+
+    let { response, url, headers, transformedBody } = await doFetch(activeCredentials);
+
+    // On 400 "Missing bearer token" — token expired, attempt refresh once
+    if (response.status === 400 && credentials?.refreshToken) {
+      const bodyText = await response
+        .clone()
+        .text()
+        .catch(() => "");
+      if (
+        bodyText.toLowerCase().includes("missing bearer token") ||
+        bodyText.toLowerCase().includes("authorization")
+      ) {
+        log?.warn?.("TOKEN", "Kiro 400 missing bearer token — attempting refresh");
+        try {
+          const refreshed = await this.refreshCredentials(credentials, log || null);
+          if (refreshed) {
+            activeCredentials = { ...credentials, ...refreshed };
+            if (onCredentialsRefreshed) await onCredentialsRefreshed(refreshed);
+            ({ response, url, headers, transformedBody } = await doFetch(activeCredentials));
+          }
+        } catch (err) {
+          log?.warn?.(
+            "TOKEN",
+            `Kiro refresh on 400 failed: ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+      }
+    }
 
     if (!response.ok) {
       return { response, url, headers, transformedBody };

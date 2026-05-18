@@ -108,6 +108,16 @@ test("KiroExecutor.buildHeaders includes Kiro-specific auth and metadata", () =>
   assert.ok(headers["Amz-Sdk-Invocation-Id"]);
 });
 
+test("KiroExecutor.buildHeaders accepts apiKey tokens and strips duplicate bearer prefix", () => {
+  const executor = new KiroExecutor();
+  const headers = executor.buildHeaders(
+    { accessToken: "", apiKey: "Bearer  kiro-api-token  " } as any,
+    true
+  );
+
+  assert.equal(headers.Authorization, "Bearer kiro-api-token");
+});
+
 test("KiroExecutor.transformRequest removes the top-level model field", () => {
   const executor = new KiroExecutor();
   const body = {

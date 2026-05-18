@@ -187,6 +187,25 @@ function mergeRtkConfig(base?: Partial<RtkConfig>, override?: Record<string, unk
 }
 
 function shouldCompressMessage(message: Message, config: RtkConfig): boolean {
+  // If message clearly contains structured tool blocks, skip RTK compression
+  if (Array.isArray(message.content)) {
+    for (const part of message.content) {
+      if (part && typeof part === "object" && typeof part.type === "string") {
+        const t = part.type.toLowerCase();
+        if (t === "tool_result" || t === "tool_use" || t === "tool_call") {
+          return false;
+        }
+      }
+    }
+  }
+  if (
+    message.tool_calls &&
+    Array.isArray((message as any).tool_calls) &&
+    (message as any).tool_calls.length > 0
+  )
+    return false;
+  if ((message as any).tool_call_id) return false;
+
   if (message.role === "tool")
     return config.applyToToolResults || (config.applyToCodeBlocks && hasCodeFence(message.content));
   if (message.role === "assistant")
