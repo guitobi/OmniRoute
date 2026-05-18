@@ -111,11 +111,25 @@ describe("selectCompressionStrategy", () => {
     assert.equal(selectCompressionStrategy(baseConfig, null, 100), "lite");
   });
 
-  it("bypasses compression for Kiro-compatible providers", () => {
+  it("caps compression at lite for Kiro providers (aggressive → lite)", () => {
     const config = { ...baseConfig, defaultMode: "aggressive" as const };
     const body = {
       messages: [{ role: "user", content: "keep this intact" }],
     };
+
+    assert.equal(
+      selectCompressionStrategy(config, null, 100, body, {
+        provider: "kiro",
+        targetFormat: "kiro",
+        model: "claude-sonnet-4.6",
+      }),
+      "lite"
+    );
+  });
+
+  it("allows off mode for Kiro when compression is disabled", () => {
+    const config = { ...baseConfig, enabled: false, defaultMode: "off" as const };
+    const body = { messages: [{ role: "user", content: "hi" }] };
 
     assert.equal(
       selectCompressionStrategy(config, null, 100, body, {
@@ -150,10 +164,13 @@ describe("selectCompressionStrategy", () => {
 });
 
 describe("shouldBypassCompressionForProvider", () => {
-  it("returns true for kiro and amazon-q provider ids", () => {
-    assert.equal(shouldBypassCompressionForProvider("kiro", null), true);
+  it("returns true for amazon-q provider id", () => {
     assert.equal(shouldBypassCompressionForProvider("amazon-q", null), true);
-    assert.equal(shouldBypassCompressionForProvider(null, "kiro"), true);
+  });
+
+  it("returns false for kiro (kiro is lite-capped, not bypassed)", () => {
+    assert.equal(shouldBypassCompressionForProvider("kiro", null), false);
+    assert.equal(shouldBypassCompressionForProvider(null, "kiro"), false);
   });
 
   it("returns false for unrelated providers", () => {
