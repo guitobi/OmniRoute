@@ -1,7 +1,7 @@
 // Provider definitions
 
 // Free Providers
-export const FREE_PROVIDERS = {
+export const FREE_PROVIDERS: Record<string, any> = {
   qoder: { id: "qoder", alias: "if", name: "Qoder AI", icon: "water_drop", color: "#6366F1" },
   qwen: {
     id: "qwen",
@@ -59,7 +59,7 @@ export function supportsApiKeyOnFreeProvider(providerId: unknown): boolean {
 }
 
 // OAuth Providers
-export const OAUTH_PROVIDERS = {
+export const OAUTH_PROVIDERS: Record<string, any> = {
   claude: { id: "claude", alias: "cc", name: "Claude Code", icon: "smart_toy", color: "#D97757" },
   antigravity: {
     id: "antigravity",
@@ -131,7 +131,7 @@ export const OAUTH_PROVIDERS = {
 };
 
 // Web / Cookie Providers
-export const WEB_COOKIE_PROVIDERS = {
+export const WEB_COOKIE_PROVIDERS: Record<string, any> = {
   "chatgpt-web": {
     id: "chatgpt-web",
     alias: "cgpt-web",
@@ -196,7 +196,7 @@ export const WEB_COOKIE_PROVIDERS = {
 };
 
 // API Key Providers
-export const APIKEY_PROVIDERS = {
+export const APIKEY_PROVIDERS: Record<string, any> = {
   agentrouter: {
     id: "agentrouter",
     alias: "agentrouter",

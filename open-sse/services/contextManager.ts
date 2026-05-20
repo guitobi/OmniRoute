@@ -14,6 +14,8 @@ const DEFAULT_LIMITS: Record<string, number> = {
   openai: 128000,
   gemini: 1000000,
   codex: 400000,
+  kiro: 16000,
+  "amazon-q": 16000,
   default: 128000,
 };
 
@@ -119,7 +121,10 @@ export function compressContext(
   const provider = options.provider || "default";
   const maxTokens =
     options.maxTokens || getTokenLimit(provider, (body.model as string) || options.model || null);
-  const defaultReserveTokens = Math.min(16000, Math.max(256, Math.floor(maxTokens * 0.15)));
+  const isKiroLikeProvider = provider === "kiro" || provider === "amazon-q";
+  const defaultReserveTokens = isKiroLikeProvider
+    ? Math.min(Math.max(1024, Math.floor(maxTokens * 0.25)), Math.max(0, maxTokens - 1))
+    : Math.min(16000, Math.max(256, Math.floor(maxTokens * 0.15)));
   const reserveTokens = Math.min(
     options.reserveTokens ?? getReserveTokensOverride() ?? defaultReserveTokens,
     Math.max(0, maxTokens - 1)
@@ -128,7 +133,14 @@ export function compressContext(
 
   let messages = [...body.messages];
   let currentTokens = estimateTokens(JSON.stringify(messages));
-  const stats = { original: currentTokens, layers: [] };
+  const stats: {
+    original: number;
+    layers: { name: string; tokens: number }[];
+    [key: string]: any;
+  } = {
+    original: currentTokens,
+    layers: [],
+  };
 
   // Already fits
   if (currentTokens <= targetTokens) {
@@ -136,7 +148,7 @@ export function compressContext(
   }
 
   // Layer 1: Trim tool_result/tool messages
-  messages = trimToolMessages(messages, 2000); // Max 2000 chars per tool result
+  messages = trimToolMessages(messages, isKiroLikeProvider ? 1000 : 2000);
   currentTokens = estimateTokens(JSON.stringify(messages));
   stats.layers.push({ name: "trim_tools", tokens: currentTokens });
 

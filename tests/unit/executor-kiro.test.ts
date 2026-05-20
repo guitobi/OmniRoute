@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { KiroExecutor } from "../../open-sse/executors/kiro.ts";
+import {
+  KiroExecutor,
+  parseKiroEventFrameForTest,
+  resetKiroExecutorProtectionForTest,
+} from "../../open-sse/executors/kiro.ts";
 
 const textEncoder = new TextEncoder();
 
@@ -233,6 +237,42 @@ test("KiroExecutor.transformEventStreamToSSE parses fragmented frames and waits 
   assert.match(text, /\[DONE\]/);
 });
 
+test("KiroExecutor.transformEventStreamToSSE parses one-byte fragmented frames", async () => {
+  const executor = new KiroExecutor();
+  const frame = buildEventFrame("assistantResponseEvent", { content: "split" });
+  const chunks = Array.from(frame, (byte) => new Uint8Array([byte]));
+  const response = buildEventStreamResponseFromChunks(chunks);
+
+  const transformed = executor.transformEventStreamToSSE(response, "kiro-model");
+  const text = await transformed.text();
+  const chunksJson = parseSSEJsonChunks(text);
+
+  assert.ok(chunksJson.some((chunk) => chunk.choices?.[0]?.delta?.content === "split"));
+  assert.match(text, /data: \[DONE\]/);
+});
+
+test("KiroExecutor.transformEventStreamToSSE skips truncated and CRC-corrupted frames", async () => {
+  const executor = new KiroExecutor();
+  const goodFrame = buildEventFrame("assistantResponseEvent", { content: "good" });
+  const truncatedFrame = goodFrame.slice(0, goodFrame.length - 5);
+  const corruptedFrame = goodFrame.slice();
+  corruptedFrame[corruptedFrame.length - 1] ^= 0xff;
+  const response = buildEventStreamResponseFromChunks([truncatedFrame, corruptedFrame]);
+
+  const transformed = executor.transformEventStreamToSSE(response, "kiro-model");
+  const text = await transformed.text();
+  const chunksJson = parseSSEJsonChunks(text);
+
+  assert.equal(
+    chunksJson.some((chunk) => chunk.choices?.[0]?.delta?.content === "good"),
+    false
+  );
+  assert.ok(chunksJson.some((chunk) => chunk.choices?.[0]?.finish_reason === "stop"));
+  assert.match(text, /data: \[DONE\]/);
+  assert.equal(parseKiroEventFrameForTest(truncatedFrame), null);
+  assert.equal(parseKiroEventFrameForTest(corruptedFrame), null);
+});
+
 test("KiroExecutor.transformEventStreamToSSE deduplicates tool starts and handles malformed payload JSON", async () => {
   const executor = new KiroExecutor();
   const response = buildEventStreamResponse([
@@ -302,6 +342,153 @@ test("KiroExecutor.execute returns upstream errors directly and transforms succe
   }
 });
 
+test("KiroExecutor.execute refreshes credentials on 401 and retries once", async () => {
+  const executor = new KiroExecutor();
+  const originalFetch = globalThis.fetch;
+  const originalRetryBase = process.env.KIRO_REFRESH_RETRY_BASE_MS;
+  process.env.KIRO_REFRESH_RETRY_BASE_MS = "0";
+  let requestCount = 0;
+  let refreshedTokenUsed = false;
+
+  globalThis.fetch = async (url, init) => {
+    const urlText = String(url);
+    if (urlText.includes("oidc.us-east-1.amazonaws.com/token")) {
+      return new Response(
+        JSON.stringify({
+          accessToken: "fresh-token",
+          refreshToken: "fresh-refresh",
+          expiresIn: 3600,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    requestCount++;
+    const headers = new Headers(init?.headers);
+    if (headers.get("Authorization") === "Bearer fresh-token") {
+      refreshedTokenUsed = true;
+      return buildEventStreamResponse([
+        buildEventFrame("assistantResponseEvent", { content: "ok" }),
+      ]);
+    }
+    return new Response("unauthorized", { status: 401 });
+  };
+
+  try {
+    const result = await executor.execute({
+      model: "kiro-model",
+      body: { conversationState: {} },
+      stream: true,
+      credentials: {
+        accessToken: "stale-token",
+        refreshToken: "refresh",
+        providerSpecificData: { clientId: "client", clientSecret: "secret" },
+      },
+    });
+
+    const text = await result.response.text();
+    assert.equal(result.response.status, 200);
+    assert.equal(requestCount, 2);
+    assert.equal(refreshedTokenUsed, true);
+    assert.match(text, /ok/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalRetryBase === undefined) delete process.env.KIRO_REFRESH_RETRY_BASE_MS;
+    else process.env.KIRO_REFRESH_RETRY_BASE_MS = originalRetryBase;
+  }
+});
+
+test("KiroExecutor.execute dedupes identical in-flight Kiro requests", async () => {
+  resetKiroExecutorProtectionForTest();
+  const executor = new KiroExecutor();
+  const originalFetch = globalThis.fetch;
+  const originalDedupeTtl = process.env.KIRO_DEDUPE_TTL_MS;
+  process.env.KIRO_DEDUPE_TTL_MS = "1000";
+  let requestCount = 0;
+  let releaseFetch;
+  const releasePromise = new Promise((resolve) => {
+    releaseFetch = resolve;
+  });
+
+  globalThis.fetch = async () => {
+    requestCount++;
+    await releasePromise;
+    return buildEventStreamResponse([
+      buildEventFrame("assistantResponseEvent", { content: "deduped" }),
+    ]);
+  };
+
+  try {
+    const input = {
+      model: "kiro-model",
+      body: { conversationState: { conversationId: "same" } },
+      stream: true,
+      credentials: { accessToken: "kiro-token", connectionId: "conn-dedupe" },
+    };
+
+    const firstPromise = executor.execute(input);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const secondPromise = executor.execute(input);
+    releaseFetch();
+
+    const [first, second] = await Promise.all([firstPromise, secondPromise]);
+    const firstText = await first.response.text();
+    const secondText = await second.response.text();
+
+    assert.equal(requestCount, 1);
+    assert.match(firstText, /deduped/);
+    assert.match(secondText, /deduped/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    resetKiroExecutorProtectionForTest();
+    if (originalDedupeTtl === undefined) delete process.env.KIRO_DEDUPE_TTL_MS;
+    else process.env.KIRO_DEDUPE_TTL_MS = originalDedupeTtl;
+  }
+});
+
+test("KiroExecutor.execute opens account circuit after repeated quota failures", async () => {
+  resetKiroExecutorProtectionForTest();
+  const executor = new KiroExecutor();
+  const originalFetch = globalThis.fetch;
+  const originalThreshold = process.env.KIRO_BREAKER_FAILURE_THRESHOLD;
+  const originalCooldown = process.env.KIRO_BREAKER_COOLDOWN_MS;
+  process.env.KIRO_BREAKER_FAILURE_THRESHOLD = "2";
+  process.env.KIRO_BREAKER_COOLDOWN_MS = "60000";
+  let requestCount = 0;
+
+  globalThis.fetch = async () => {
+    requestCount++;
+    return new Response("quota exceeded", { status: 429 });
+  };
+
+  try {
+    const input = {
+      model: "kiro-model",
+      body: { conversationState: { conversationId: "breaker" } },
+      stream: true,
+      credentials: { accessToken: "kiro-token", connectionId: "conn-breaker" },
+    };
+
+    const first = await executor.execute(input);
+    const second = await executor.execute(input);
+    const third = await executor.execute(input);
+    const thirdText = await third.response.text();
+
+    assert.equal(first.response.status, 429);
+    assert.equal(second.response.status, 429);
+    assert.equal(third.response.status, 503);
+    assert.equal(requestCount, 8);
+    assert.match(thirdText, /kiro_account_circuit_open/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    resetKiroExecutorProtectionForTest();
+    if (originalThreshold === undefined) delete process.env.KIRO_BREAKER_FAILURE_THRESHOLD;
+    else process.env.KIRO_BREAKER_FAILURE_THRESHOLD = originalThreshold;
+    if (originalCooldown === undefined) delete process.env.KIRO_BREAKER_COOLDOWN_MS;
+    else process.env.KIRO_BREAKER_COOLDOWN_MS = originalCooldown;
+  }
+});
+
 test("KiroExecutor.refreshCredentials handles missing and AWS-style refresh tokens", async () => {
   const executor = new KiroExecutor();
   const originalFetch = globalThis.fetch;
@@ -333,6 +520,51 @@ test("KiroExecutor.refreshCredentials handles missing and AWS-style refresh toke
     });
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("KiroExecutor.refreshCredentials retries transient null refresh results", async () => {
+  const executor = new KiroExecutor();
+  const originalFetch = globalThis.fetch;
+  const originalRetryBase = process.env.KIRO_REFRESH_RETRY_BASE_MS;
+  process.env.KIRO_REFRESH_RETRY_BASE_MS = "0";
+  let attempts = 0;
+
+  globalThis.fetch = async () => {
+    attempts++;
+    if (attempts < 3) {
+      return new Response("temporary", { status: 503 });
+    }
+
+    return new Response(
+      JSON.stringify({
+        accessToken: "new-access-token",
+        refreshToken: "new-refresh-token",
+        expiresIn: 3600,
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  };
+
+  try {
+    const result = await executor.refreshCredentials(
+      {
+        refreshToken: "refresh",
+        providerSpecificData: { clientId: "client", clientSecret: "secret" },
+      },
+      null
+    );
+
+    assert.equal(attempts, 3);
+    assert.deepEqual(result, {
+      accessToken: "new-access-token",
+      refreshToken: "new-refresh-token",
+      expiresIn: 3600,
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalRetryBase === undefined) delete process.env.KIRO_REFRESH_RETRY_BASE_MS;
+    else process.env.KIRO_REFRESH_RETRY_BASE_MS = originalRetryBase;
   }
 });
 
