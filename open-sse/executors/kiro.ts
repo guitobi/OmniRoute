@@ -38,6 +38,10 @@ type EventFrame = {
   payload: JsonRecord | null;
 };
 
+type KiroRefreshResult = ProviderCredentials & {
+  expiresIn?: number;
+};
+
 class ByteQueue {
   private chunks: Uint8Array[] = [];
   private headOffset = 0;
@@ -102,6 +106,33 @@ class ByteQueue {
 const CRC32_TABLE = new Uint32Array(256);
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
+const KIRO_REFRESH_MAX_ATTEMPTS = 3;
+const KIRO_REFRESH_RETRY_BASE_MS = 250;
+const KIRO_AUTH_FAILURE_STATUSES = new Set([401, 403]);
+const KIRO_DEDUPE_TTL_MS = 30_000;
+const KIRO_BREAKER_FAILURE_THRESHOLD = 3;
+const KIRO_BREAKER_COOLDOWN_MS = 60_000;
+
+interface KiroDedupeSnapshot {
+  status: number;
+  statusText: string;
+  headers: Record<string, string>;
+  bodyBase64: string;
+}
+
+interface KiroDedupeEntry {
+  expiresAt: number;
+  promise: Promise<KiroDedupeSnapshot>;
+}
+
+interface KiroBreakerState {
+  failures: number;
+  openUntil: number;
+  lastFailureAt: number;
+}
+
+const kiroInFlightResponses = new Map<string, KiroDedupeEntry>();
+const kiroAccountBreakers = new Map<string, KiroBreakerState>();
 for (let i = 0; i < 256; i++) {
   let c = i;
   for (let j = 0; j < 8; j++) {
@@ -144,6 +175,157 @@ function buildKiroFinishChunk(
   }
 
   return finishChunk;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function toError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
+}
+
+function readRefreshRetryBaseMs(): number {
+  const raw = Number(process.env.KIRO_REFRESH_RETRY_BASE_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : KIRO_REFRESH_RETRY_BASE_MS;
+}
+
+function isKiroAuthFailureResponse(status: number, bodyText: string): boolean {
+  if (KIRO_AUTH_FAILURE_STATUSES.has(status)) return true;
+  if (status !== 400) return false;
+
+  const normalized = bodyText.toLowerCase();
+  return (
+    normalized.includes("missing bearer token") ||
+    normalized.includes("authorization") ||
+    normalized.includes("unauthorized") ||
+    normalized.includes("expired token") ||
+    normalized.includes("invalid token") ||
+    normalized.includes("token expired")
+  );
+}
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
+    .join(",")}}`;
+}
+
+function hashString(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < value.length; i++) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
+function getKiroAccountKey(credentials: ProviderCredentials): string {
+  if (credentials.connectionId) return `connection:${credentials.connectionId}`;
+  const token =
+    credentials.accessToken || credentials.apiKey || credentials.refreshToken || "anonymous";
+  return `token:${hashString(token)}`;
+}
+
+function getKiroDedupeKey(model: string, transformedBody: unknown, accountKey: string): string {
+  return `${accountKey}:${model}:${hashString(stableStringify(transformedBody))}`;
+}
+
+function readPositiveNumberEnv(name: string, fallback: number): number {
+  const raw = Number(process.env[name]);
+  return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}
+
+function readKiroDedupeTtlMs(): number {
+  return readPositiveNumberEnv("KIRO_DEDUPE_TTL_MS", KIRO_DEDUPE_TTL_MS);
+}
+
+function readKiroBreakerThreshold(): number {
+  return readPositiveNumberEnv("KIRO_BREAKER_FAILURE_THRESHOLD", KIRO_BREAKER_FAILURE_THRESHOLD);
+}
+
+function readKiroBreakerCooldownMs(): number {
+  return readPositiveNumberEnv("KIRO_BREAKER_COOLDOWN_MS", KIRO_BREAKER_COOLDOWN_MS);
+}
+
+function pruneKiroDedupe(now = Date.now()): void {
+  for (const [key, entry] of kiroInFlightResponses) {
+    if (entry.expiresAt <= now) kiroInFlightResponses.delete(key);
+  }
+}
+
+function buildKiroCircuitOpenResponse(accountKey: string, retryAfterMs: number): Response {
+  return new Response(
+    JSON.stringify({
+      error: {
+        message: "Kiro account circuit breaker is open",
+        type: "server_error",
+        code: "kiro_account_circuit_open",
+        account: accountKey,
+      },
+    }),
+    {
+      status: 503,
+      headers: {
+        "Content-Type": "application/json",
+        "Retry-After": String(Math.max(1, Math.ceil(retryAfterMs / 1000))),
+      },
+    }
+  );
+}
+
+function getKiroCircuitOpenMs(accountKey: string, now = Date.now()): number {
+  const state = kiroAccountBreakers.get(accountKey);
+  if (!state || state.openUntil <= now) return 0;
+  return state.openUntil - now;
+}
+
+function resetKiroCircuit(accountKey: string): void {
+  kiroAccountBreakers.delete(accountKey);
+}
+
+function isKiroBreakerFailure(status: number, bodyText: string): boolean {
+  if (status === 429 || status === 401 || status === 403) return true;
+  if (status !== 400 && status !== 402 && status !== 409) return false;
+
+  const normalized = bodyText.toLowerCase();
+  return (
+    normalized.includes("quota") ||
+    normalized.includes("rate limit") ||
+    normalized.includes("too many requests") ||
+    normalized.includes("credit") ||
+    normalized.includes("insufficient") ||
+    isKiroAuthFailureResponse(status, bodyText)
+  );
+}
+
+function recordKiroBreakerFailure(accountKey: string, log?: ExecutorLog | null): void {
+  const now = Date.now();
+  const threshold = readKiroBreakerThreshold();
+  const cooldownMs = readKiroBreakerCooldownMs();
+  const current = kiroAccountBreakers.get(accountKey);
+  const failures =
+    (current?.openUntil && current.openUntil > now ? current.failures : current?.failures || 0) + 1;
+  const openUntil = failures >= threshold ? now + cooldownMs : 0;
+
+  kiroAccountBreakers.set(accountKey, { failures, openUntil, lastFailureAt: now });
+
+  if (openUntil > now) {
+    log?.warn?.(
+      "KIRO_CIRCUIT",
+      `Kiro account circuit opened: account=${accountKey} failures=${failures} cooldownMs=${cooldownMs}`
+    );
+  }
+}
+
+export function resetKiroExecutorProtectionForTest(): void {
+  kiroInFlightResponses.clear();
+  kiroAccountBreakers.clear();
 }
 
 function ensureKiroUsage(state: KiroStreamState) {
@@ -229,6 +411,7 @@ export class KiroExecutor extends BaseExecutor {
     if (b.conversationState !== undefined) kiroPayload.conversationState = b.conversationState;
     if (b.profileArn !== undefined) kiroPayload.profileArn = b.profileArn;
     if (b.inferenceConfig !== undefined) kiroPayload.inferenceConfig = b.inferenceConfig;
+    delete b._omnirouteCompressionStats;
 
     // Fallback: if somehow conversationState isn't there, return the rest without model
     // (for backward compatibility if something else bypasses the translator)
@@ -273,8 +456,9 @@ export class KiroExecutor extends BaseExecutor {
       if (!connectionId) return;
       try {
         const { updateProviderConnection } = await import("../../src/lib/db/providers.ts");
-        const expiresAt = refreshed.expiresIn
-          ? new Date(Date.now() + (refreshed.expiresIn as number) * 1000).toISOString()
+        const refreshedWithExpiry = refreshed as KiroRefreshResult;
+        const expiresAt = refreshedWithExpiry.expiresIn
+          ? new Date(Date.now() + refreshedWithExpiry.expiresIn * 1000).toISOString()
           : undefined;
         await updateProviderConnection(connectionId, {
           ...(refreshed.accessToken ? { accessToken: refreshed.accessToken } : {}),
@@ -282,7 +466,10 @@ export class KiroExecutor extends BaseExecutor {
           ...(expiresAt ? { expiresAt, tokenExpiresAt: expiresAt } : {}),
         });
       } catch (err) {
-        log?.warn?.("TOKEN", `Kiro DB persist failed: ${err instanceof Error ? err.message : String(err)}`);
+        log?.warn?.(
+          "TOKEN",
+          `Kiro DB persist failed: ${err instanceof Error ? err.message : String(err)}`
+        );
       }
     };
 
@@ -295,11 +482,15 @@ export class KiroExecutor extends BaseExecutor {
           await persistRefreshed(refreshed);
         }
       } catch (err) {
-        log?.warn?.(
-          "TOKEN",
-          `Kiro proactive refresh failed: ${err instanceof Error ? err.message : String(err)}`
-        );
+        log?.warn?.("TOKEN", `Kiro proactive refresh failed: ${toError(err).message}`);
       }
+    }
+
+    const accountKey = getKiroAccountKey(credentials);
+    const openMs = getKiroCircuitOpenMs(accountKey);
+    if (openMs > 0) {
+      const circuitResponse = buildKiroCircuitOpenResponse(accountKey, openMs);
+      return { response: circuitResponse, url: this.buildUrl(model, stream, 0), headers: {} };
     }
 
     const doFetch = async (creds: ProviderCredentials) => {
@@ -320,51 +511,168 @@ export class KiroExecutor extends BaseExecutor {
         /* swallow logging errors */
       }
       const transformedBody = await this.transformRequest(model, body, stream, creds);
-      const response = await fetch(url, {
+      const serializedBody = JSON.stringify(transformedBody);
+      const dedupeKey = getKiroDedupeKey(model, transformedBody, getKiroAccountKey(creds));
+      const dedupeTtlMs = readKiroDedupeTtlMs();
+      pruneKiroDedupe();
+
+      const existing = kiroInFlightResponses.get(dedupeKey);
+      if (existing && existing.expiresAt > Date.now()) {
+        log?.info?.("KIRO_DEDUPE", `Kiro request deduped: model=${model}`);
+        const snapshot = await existing.promise;
+        const response = new Response(Buffer.from(snapshot.bodyBase64, "base64"), {
+          status: snapshot.status,
+          statusText: snapshot.statusText,
+          headers: snapshot.headers,
+        });
+        return { response, url, headers, transformedBody };
+      }
+
+      const responsePromise = fetch(url, {
         method: "POST",
         headers,
-        body: JSON.stringify(transformedBody),
+        body: serializedBody,
         signal,
       });
+
+      if (stream) {
+        const promise = responsePromise
+          .then(async (dedupeResponse): Promise<KiroDedupeSnapshot> => {
+            if (!dedupeResponse.ok) {
+              kiroInFlightResponses.delete(dedupeKey);
+              return {
+                status: dedupeResponse.status,
+                statusText: dedupeResponse.statusText,
+                headers: Object.fromEntries(dedupeResponse.headers.entries()),
+                bodyBase64: "",
+              };
+            }
+
+            const clone = dedupeResponse.clone();
+            const buffer = await clone.arrayBuffer();
+            return {
+              status: dedupeResponse.status,
+              statusText: dedupeResponse.statusText,
+              headers: Object.fromEntries(dedupeResponse.headers.entries()),
+              bodyBase64: Buffer.from(buffer).toString("base64"),
+            };
+          })
+          .finally(() => {
+            setTimeout(() => kiroInFlightResponses.delete(dedupeKey), dedupeTtlMs).unref?.();
+          });
+
+        kiroInFlightResponses.set(dedupeKey, { expiresAt: Date.now() + dedupeTtlMs, promise });
+      }
+
+      const response = await responsePromise;
+      if (!response.ok) {
+        kiroInFlightResponses.delete(dedupeKey);
+      }
+
       return { response, url, headers, transformedBody };
     };
 
-    let { response, url, headers, transformedBody } = await doFetch(activeCredentials);
+    // Retry loop: respect Retry-After and apply exponential backoff + jitter
+    const retriableStatus = new Set([429, 502, 503, 504]);
+    const maxAttempts = 4;
+    let attempt = 0;
+    let response: Response | undefined = undefined;
+    let url = "";
+    let headers: Record<string, string> = {};
+    let transformedBody: unknown = undefined;
 
-    // On 400 "Missing bearer token" — token expired, attempt refresh once
-    if (response.status === 400 && credentials?.refreshToken) {
-      const bodyText = await response
-        .clone()
-        .text()
-        .catch(() => "");
-      if (
-        bodyText.toLowerCase().includes("missing bearer token") ||
-        bodyText.toLowerCase().includes("authorization")
-      ) {
-        log?.warn?.("TOKEN", "Kiro 400 missing bearer token — attempting refresh");
-        try {
-          const refreshed = await this.refreshCredentials(credentials, log || null);
-          if (refreshed) {
-            activeCredentials = { ...credentials, ...refreshed };
-            await persistRefreshed(refreshed);
-            ({ response, url, headers, transformedBody } = await doFetch(activeCredentials));
+    while (attempt < maxAttempts) {
+      attempt++;
+      ({ response, url, headers, transformedBody } = await doFetch(activeCredentials));
+
+      // On auth failures — token expired/revoked, attempt refresh once before returning error.
+      if (credentials?.refreshToken) {
+        const bodyText = await response
+          .clone()
+          .text()
+          .catch(() => "");
+        if (isKiroAuthFailureResponse(response.status, bodyText)) {
+          log?.warn?.("TOKEN", `Kiro ${response.status} auth failure — attempting refresh`);
+          try {
+            const refreshed = await this.refreshCredentials(credentials, log || null);
+            if (refreshed) {
+              activeCredentials = { ...credentials, ...refreshed };
+              await persistRefreshed(refreshed);
+              ({ response, url, headers, transformedBody } = await doFetch(activeCredentials));
+            }
+          } catch (err) {
+            log?.warn?.("TOKEN", `Kiro refresh on auth failure failed: ${toError(err).message}`);
           }
-        } catch (err) {
-          log?.warn?.(
-            "TOKEN",
-            `Kiro refresh on 400 failed: ${err instanceof Error ? err.message : String(err)}`
-          );
         }
       }
+
+      // If successful, break
+      if (response.ok) break;
+
+      // If status is retriable, compute wait
+      const status = response.status;
+      if (retriableStatus.has(status) && attempt < maxAttempts) {
+        let waitMs = 1000 * Math.pow(2, attempt - 1); // 1s,2s,4s...
+        // Respect Retry-After header if present (in seconds or http-date)
+        try {
+          const ra = response.headers.get("retry-after");
+          if (ra) {
+            const raInt = parseInt(ra, 10);
+            if (!Number.isNaN(raInt)) {
+              waitMs = Math.max(waitMs, raInt * 1000);
+            } else {
+              const date = Date.parse(ra);
+              if (!Number.isNaN(date)) {
+                const delta = date - Date.now();
+                if (delta > 0) waitMs = Math.max(waitMs, delta);
+              }
+            }
+          }
+        } catch (_e) {
+          /* ignore header parse errors */
+        }
+
+        // Add jitter
+        const jitter = Math.floor(Math.random() * Math.min(1000, Math.floor(waitMs / 2)));
+        waitMs = waitMs + jitter;
+
+        log?.info?.("RETRY", `Kiro retry attempt=${attempt} status=${status} waitMs=${waitMs}`);
+        await new Promise((res) => setTimeout(res, waitMs));
+        continue; // next attempt
+      }
+
+      // Non-retriable or max attempts reached
+      break;
     }
 
-    if (!response.ok) {
+    if (!response || !response.ok) {
+      if (response) {
+        const bodyText = await response
+          .clone()
+          .text()
+          .catch(() => "");
+        if (isKiroBreakerFailure(response.status, bodyText)) {
+          recordKiroBreakerFailure(accountKey, log || null);
+        }
+      }
       return { response, url, headers, transformedBody };
+    }
+
+    resetKiroCircuit(accountKey);
+
+    // Emit lightweight telemetry/logging for Kiro executions
+    try {
+      log?.info?.(
+        "KIRO_EXECUTE",
+        `Kiro execute succeeded: model=${model} status=${response.status} attempt=${attempt} url=${url}`
+      );
+    } catch (_e) {
+      /* swallow telemetry errors */
     }
 
     // For Kiro, we need to transform the binary EventStream to SSE
     // Create a TransformStream to convert binary to SSE text
-    const transformedResponse = this.transformEventStreamToSSE(response, model);
+    const transformedResponse = this.transformEventStreamToSSE(response, model, transformedBody);
 
     return { response: transformedResponse, url, headers, transformedBody };
   }
@@ -373,7 +681,7 @@ export class KiroExecutor extends BaseExecutor {
    * Transform AWS EventStream binary response to SSE text stream
    * Using TransformStream instead of ReadableStream.pull() to avoid Workers timeout
    */
-  transformEventStreamToSSE(response: Response, model: string) {
+  transformEventStreamToSSE(response: Response, model: string, transformedBody?: unknown) {
     const buffer = new ByteQueue();
     let chunkIndex = 0;
     const responseId = `chatcmpl-${Date.now()}`;
@@ -613,7 +921,7 @@ export class KiroExecutor extends BaseExecutor {
         }
       },
 
-      flush(controller) {
+      async flush(controller) {
         // Emit finish chunk if not already sent
         if (!state.finishEmitted) {
           state.finishEmitted = true;
@@ -624,6 +932,36 @@ export class KiroExecutor extends BaseExecutor {
 
         // Send final done message
         controller.enqueue(TEXT_ENCODER.encode("data: [DONE]\n\n"));
+        // Best-effort: persist usage to DB for token accounting
+        try {
+          const { insertKiroUsageRow } = await import("../../src/lib/db/kiroUsage.ts");
+          const transformedRecord =
+            transformedBody && typeof transformedBody === "object"
+              ? (transformedBody as Record<string, unknown>)
+              : null;
+          const conversationState =
+            transformedRecord?.conversationState &&
+            typeof transformedRecord.conversationState === "object"
+              ? (transformedRecord.conversationState as Record<string, unknown>)
+              : null;
+          const conversationId =
+            typeof conversationState?.conversationId === "string"
+              ? conversationState.conversationId
+              : null;
+          insertKiroUsageRow({
+            timestamp: new Date().toISOString(),
+            connection_id: undefined,
+            conversation_id: conversationId,
+            provider: "kiro",
+            model,
+            prompt_tokens: state.usage?.prompt_tokens ?? null,
+            completion_tokens: state.usage?.completion_tokens ?? null,
+            total_tokens: state.usage?.total_tokens ?? null,
+            raw: JSON.stringify({ metrics: state.usage }).substring(0, 4000),
+          });
+        } catch (_e) {
+          /* best-effort telemetry; swallow errors */
+        }
       },
     });
 
@@ -649,31 +987,58 @@ export class KiroExecutor extends BaseExecutor {
   async refreshCredentials(credentials: ProviderCredentials, log?: ExecutorLog | null) {
     if (!credentials.refreshToken) return null;
 
-    try {
-      // Use centralized refreshKiroToken function (handles both AWS SSO OIDC and Social Auth)
-      const result = await refreshKiroToken(
-        credentials.refreshToken,
-        credentials.providerSpecificData,
-        log
-      );
+    const retryBaseMs = readRefreshRetryBaseMs();
+    let lastError: Error | null = null;
 
-      return result;
-    } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
-      log?.error?.("TOKEN", `Kiro refresh error: ${err.message}`);
-      return null;
+    for (let attempt = 1; attempt <= KIRO_REFRESH_MAX_ATTEMPTS; attempt++) {
+      try {
+        // Use centralized refreshKiroToken function (handles both AWS SSO OIDC and Social Auth)
+        const result = await refreshKiroToken(
+          credentials.refreshToken,
+          credentials.providerSpecificData,
+          log
+        );
+
+        if (result) return result;
+        log?.warn?.("TOKEN", `Kiro refresh attempt ${attempt} returned no credentials`);
+      } catch (error) {
+        lastError = toError(error);
+        log?.warn?.("TOKEN", `Kiro refresh attempt ${attempt} failed: ${lastError.message}`);
+      }
+
+      if (attempt < KIRO_REFRESH_MAX_ATTEMPTS && retryBaseMs > 0) {
+        await delay(retryBaseMs * Math.pow(2, attempt - 1));
+      }
     }
+
+    if (lastError) {
+      log?.error?.("TOKEN", `Kiro refresh error: ${lastError.message}`);
+    }
+    return null;
   }
 }
 
 /**
  * Parse AWS EventStream frame
  */
+export function parseKiroEventFrameForTest(data: Uint8Array): EventFrame | null {
+  return parseEventFrame(data);
+}
+
 function parseEventFrame(data: Uint8Array): EventFrame | null {
   try {
-    const view = new DataView(data.buffer, data.byteOffset);
+    if (data.length < 16) return null;
+
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
     const totalLength = view.getUint32(0, false);
     const headersLength = view.getUint32(4, false);
+
+    if (totalLength !== data.length || headersLength > totalLength - 16) {
+      console.warn(
+        `[Kiro] Invalid frame length: total=${totalLength}, headers=${headersLength}, bytes=${data.length}`
+      );
+      return null;
+    }
 
     // ── CRC32 validation ──
     // Prelude CRC covers bytes [0..7] (totalLength + headersLength)
@@ -713,6 +1078,7 @@ function parseEventFrame(data: Uint8Array): EventFrame | null {
 
       if (headerType === 7) {
         // String type
+        if (offset + 2 > data.length) break;
         const valueLen = (data[offset] << 8) | data[offset + 1];
         offset += 2;
         if (offset + valueLen > data.length) break;
