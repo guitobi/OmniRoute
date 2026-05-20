@@ -141,3 +141,32 @@ test("chatCore integration: compression handles tool messages", async () => {
     "Tool message should have truncation marker"
   );
 });
+
+test("chatCore integration: Kiro compression uses smaller default context and tool caps", async () => {
+  const { compressContext } = await import("../../open-sse/services/contextManager.ts");
+
+  const longToolOutput = "x".repeat(50000);
+  const body = {
+    model: "claude-sonnet-4",
+    messages: [
+      { role: "system", content: "You are helpful." },
+      { role: "user", content: "Run the tool" },
+      { role: "assistant", content: "Running tool", tool_calls: [{ id: "t1", type: "function" }] },
+      { role: "tool", content: longToolOutput, tool_call_id: "t1" },
+      { role: "user", content: "What's the result?" },
+    ],
+  };
+
+  const result = compressContext(body, {
+    provider: "kiro",
+    model: "claude-sonnet-4",
+    maxTokens: 12000,
+    reserveTokens: 4096,
+  });
+
+  assert.ok(result.compressed, "Kiro context should be compressed with conservative defaults");
+  const toolMessage = (result.body as any).messages.find((m: any) => m.role === "tool");
+  assert.ok(toolMessage, "Tool message should exist");
+  assert.ok(toolMessage.content.length <= 1100, "Kiro tool output should use compact cap");
+  assert.ok(toolMessage.content.includes("[truncated]"));
+});

@@ -5,6 +5,244 @@
 import { register } from "../registry.ts";
 import { FORMATS } from "../formats.ts";
 import { v4 as uuidv4, v5 as uuidv5 } from "uuid";
+import { compressContext } from "../../services/contextManager.ts";
+
+const KIRO_DEFAULT_CONTEXT_MAX_TOKENS = 16000;
+const KIRO_DEFAULT_CONTEXT_RESERVE_TOKENS = 4096;
+const KIRO_DEFAULT_TOOL_RESULT_MAX_CHARS = 2000;
+const KIRO_DEFAULT_TOOL_DOC_MAX_CHARS = 6000;
+
+type KiroEconomyProfileName = "safe" | "balanced" | "aggressive";
+
+interface KiroEconomyProfile {
+  name: KiroEconomyProfileName;
+  contextMaxTokens: number;
+  reserveTokens: number;
+  toolResultMaxChars: number;
+  errorToolResultMaxChars: number;
+  toolDocMaxChars: number;
+  maxOutputTokens: number;
+  preserveTailTurns: number;
+  summaryTriggerTurns: number;
+  summaryMaxChars: number;
+}
+
+const KIRO_ECONOMY_PROFILES: Record<KiroEconomyProfileName, KiroEconomyProfile> = {
+  safe: {
+    name: "safe",
+    contextMaxTokens: KIRO_DEFAULT_CONTEXT_MAX_TOKENS,
+    reserveTokens: KIRO_DEFAULT_CONTEXT_RESERVE_TOKENS,
+    toolResultMaxChars: KIRO_DEFAULT_TOOL_RESULT_MAX_CHARS,
+    errorToolResultMaxChars: 3200,
+    toolDocMaxChars: KIRO_DEFAULT_TOOL_DOC_MAX_CHARS,
+    maxOutputTokens: 1024,
+    preserveTailTurns: 4,
+    summaryTriggerTurns: 14,
+    summaryMaxChars: 3000,
+  },
+  balanced: {
+    name: "balanced",
+    contextMaxTokens: 12000,
+    reserveTokens: 3072,
+    toolResultMaxChars: 1200,
+    errorToolResultMaxChars: 2400,
+    toolDocMaxChars: 4000,
+    maxOutputTokens: 768,
+    preserveTailTurns: 4,
+    summaryTriggerTurns: 10,
+    summaryMaxChars: 2200,
+  },
+  aggressive: {
+    name: "aggressive",
+    contextMaxTokens: 9000,
+    reserveTokens: 2048,
+    toolResultMaxChars: 800,
+    errorToolResultMaxChars: 1800,
+    toolDocMaxChars: 2500,
+    maxOutputTokens: 512,
+    preserveTailTurns: 3,
+    summaryTriggerTurns: 8,
+    summaryMaxChars: 1600,
+  },
+};
+
+function readPositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function stringifyKiroContent(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value == null) return "";
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (!item || typeof item !== "object") return String(item ?? "");
+        const block = item as Record<string, unknown>;
+        if (typeof block.text === "string") return block.text;
+        if (typeof block.content === "string") return block.content;
+        try {
+          return JSON.stringify(block);
+        } catch {
+          return "";
+        }
+      })
+      .filter(Boolean)
+      .join("\n");
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function readKiroEconomyProfile(): KiroEconomyProfile {
+  const raw = (process.env.KIRO_ECONOMY_PROFILE || "balanced").toLowerCase();
+  const name: KiroEconomyProfileName =
+    raw === "safe" || raw === "balanced" || raw === "aggressive" ? raw : "balanced";
+  const base = KIRO_ECONOMY_PROFILES[name];
+
+  return {
+    ...base,
+    contextMaxTokens: readPositiveIntEnv("KIRO_CONTEXT_MAX_TOKENS", base.contextMaxTokens),
+    reserveTokens: readPositiveIntEnv("KIRO_CONTEXT_RESERVE_TOKENS", base.reserveTokens),
+    toolResultMaxChars: readPositiveIntEnv("KIRO_TOOL_RESULT_MAX_CHARS", base.toolResultMaxChars),
+    errorToolResultMaxChars: readPositiveIntEnv(
+      "KIRO_ERROR_TOOL_RESULT_MAX_CHARS",
+      base.errorToolResultMaxChars
+    ),
+    toolDocMaxChars: readPositiveIntEnv("KIRO_TOOL_DESCRIPTION_MAX_CHARS", base.toolDocMaxChars),
+    maxOutputTokens: readPositiveIntEnv("KIRO_MAX_OUTPUT_TOKENS", base.maxOutputTokens),
+    preserveTailTurns: readPositiveIntEnv("KIRO_PRESERVE_TAIL_TURNS", base.preserveTailTurns),
+    summaryTriggerTurns: readPositiveIntEnv("KIRO_SUMMARY_TRIGGER_TURNS", base.summaryTriggerTurns),
+    summaryMaxChars: readPositiveIntEnv("KIRO_SUMMARY_MAX_CHARS", base.summaryMaxChars),
+  };
+}
+
+function truncateKiroText(value: string, maxChars: number, label = "truncated"): string {
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, maxChars)}\n...[${label}: ${value.length - maxChars} chars omitted]`;
+}
+
+function truncateKiroToolResult(value: string, maxChars: number, isError: boolean): string {
+  if (value.length <= maxChars) return value;
+
+  const lines = value.split(/\r?\n/);
+  const importantLines = lines.filter((line) =>
+    /(?:error|exception|failed|failure|traceback|stack|exit code|\b[a-zA-Z]:\\|\.tsx?:\d+|\.jsx?:\d+|\.py:\d+)/i.test(
+      line
+    )
+  );
+  const headBudget = Math.max(160, Math.floor(maxChars * (isError ? 0.35 : 0.3)));
+  const tailBudget = Math.max(240, Math.floor(maxChars * (isError ? 0.45 : 0.55)));
+  const importantBudget = Math.max(0, maxChars - headBudget - tailBudget - 160);
+  const importantText = importantLines.join("\n").slice(0, importantBudget);
+  const head = value.slice(0, headBudget);
+  const tail = value.slice(Math.max(0, value.length - tailBudget));
+  const middle = importantText ? `\n...[important lines]\n${importantText}` : "";
+
+  return `${head}${middle}\n...[tool result truncated: ${value.length - maxChars} chars omitted]\n${tail}`;
+}
+
+function truncateKiroSummary(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  const headBudget = Math.max(400, Math.floor(maxChars * 0.55));
+  const tailBudget = Math.max(300, Math.floor(maxChars * 0.35));
+  const head = value.slice(0, headBudget);
+  const tail = value.slice(Math.max(0, value.length - tailBudget));
+  return `${head}\n...[summary compacted: ${value.length - maxChars} chars omitted]\n${tail}`;
+}
+
+function getKiroHistoryText(item: unknown): { role: "user" | "assistant"; content: string } | null {
+  if (!item || typeof item !== "object") return null;
+  const record = item as Record<string, any>;
+  if (record.userInputMessage && typeof record.userInputMessage === "object") {
+    return { role: "user", content: stringifyKiroContent(record.userInputMessage.content) };
+  }
+  if (record.assistantResponseMessage && typeof record.assistantResponseMessage === "object") {
+    return {
+      role: "assistant",
+      content: stringifyKiroContent(record.assistantResponseMessage.content),
+    };
+  }
+  return null;
+}
+
+function buildKiroHistorySummary(history: unknown[], economyProfile: KiroEconomyProfile): string {
+  const importantLines: string[] = [];
+  const turnSummaries: string[] = [];
+
+  history.forEach((item, index) => {
+    const text = getKiroHistoryText(item);
+    if (!text || !text.content.trim()) return;
+    const compact = text.content.replace(/\s+/g, " ").trim();
+    turnSummaries.push(`${index + 1}. ${text.role}: ${compact.slice(0, 220)}`);
+
+    const matches = text.content
+      .split(/\r?\n/)
+      .filter((line) =>
+        /(?:error|exception|failed|failure|traceback|stack|exit code|\b[a-zA-Z]:\\|[\w./-]+\.(?:ts|tsx|js|jsx|py|json|md):\d+)/i.test(
+          line
+        )
+      )
+      .slice(0, 8);
+    importantLines.push(...matches);
+  });
+
+  const important = importantLines.length
+    ? `\nImportant preserved lines:\n${importantLines.slice(0, 24).join("\n")}`
+    : "";
+  const rawSummary = `Previous conversation compacted for Kiro account savings. Preserve current user intent and recent turns below.\n${turnSummaries.join("\n")}${important}`;
+
+  return truncateKiroSummary(rawSummary, economyProfile.summaryMaxChars);
+}
+
+function compactKiroHistoryForSavings(
+  history: unknown[],
+  economyProfile: KiroEconomyProfile
+): unknown[] {
+  if (history.length < economyProfile.summaryTriggerTurns) return history;
+
+  const preserveFrom = Math.max(0, history.length - economyProfile.preserveTailTurns);
+  if (preserveFrom < 4) return history;
+
+  const oldHistory = history.slice(0, preserveFrom);
+  const recentHistory = history.slice(preserveFrom);
+  const summaryTurn = {
+    userInputMessage: {
+      content: buildKiroHistorySummary(oldHistory, economyProfile),
+      modelId: "",
+      origin: "AI_EDITOR",
+    },
+  };
+
+  if (recentHistory[0] && (recentHistory[0] as Record<string, unknown>).userInputMessage) {
+    const syntheticAssistantTurn = {
+      assistantResponseMessage: { content: "(summary acknowledged)" },
+    };
+    Object.defineProperty(syntheticAssistantTurn, "__synthetic", {
+      value: true,
+      enumerable: false,
+      configurable: true,
+    });
+    return [summaryTurn, syntheticAssistantTurn, ...recentHistory];
+  }
+
+  return [summaryTurn, ...recentHistory];
+}
+
+function compressionStatsFromContext(stats: unknown): { original: number; final: number } | null {
+  if (!stats || typeof stats !== "object") return null;
+  const record = stats as Record<string, unknown>;
+  const original = typeof record.original === "number" ? record.original : null;
+  const final = typeof record.final === "number" ? record.final : null;
+  if (original == null || final == null || final >= original) return null;
+  return { original, final };
+}
 
 function parseToolInput(value: unknown) {
   if (value && typeof value === "object" && !Array.isArray(value)) {
@@ -159,11 +397,44 @@ function stripUnsupportedKiroTopLevelFields(payload: Record<string, unknown>): v
   delete payload.system;
 }
 
+export function consumeKiroCompressionStats(payload: unknown): {
+  originalTokens: number;
+  compressedTokens: number;
+  tokensCompressed: number;
+} | null {
+  if (!payload || typeof payload !== "object") return null;
+  const record = payload as Record<string, unknown>;
+  const rawStats = record._omnirouteCompressionStats;
+  delete record._omnirouteCompressionStats;
+  if (!rawStats || typeof rawStats !== "object") return null;
+
+  const stats = rawStats as Record<string, unknown>;
+  const originalTokens = typeof stats.originalTokens === "number" ? stats.originalTokens : null;
+  const compressedTokens =
+    typeof stats.compressedTokens === "number" ? stats.compressedTokens : null;
+  const tokensCompressed =
+    typeof stats.tokensCompressed === "number" ? stats.tokensCompressed : null;
+  if (
+    originalTokens == null ||
+    compressedTokens == null ||
+    tokensCompressed == null ||
+    tokensCompressed <= 0
+  ) {
+    return null;
+  }
+
+  return {
+    originalTokens,
+    compressedTokens,
+    tokensCompressed,
+  };
+}
+
 /**
  * Convert OpenAI messages to Kiro format
  * Rules: system/tool/user -> user role, merge consecutive same roles
  */
-function convertMessages(messages, tools, model) {
+function convertMessages(messages, tools, model, economyProfile: KiroEconomyProfile) {
   let history = [];
   let currentMessage = null;
 
@@ -217,9 +488,9 @@ function convertMessages(messages, tools, model) {
         if (!userMsg.userInputMessage.userInputMessageContext) {
           userMsg.userInputMessage.userInputMessageContext = {};
         }
-        // Kiro API rejects requests with tool descriptions > ~10000 chars.
-        // Move long descriptions to system prompt (same approach as kiro-gateway).
-        const TOOL_DESC_MAX = 10000;
+        // Kiro API rejects very large tool descriptions. Keep schema compact
+        // and move bounded docs into prompt for account/context savings.
+        const toolDescriptionMax = economyProfile.toolDocMaxChars;
         const toolDocs: string[] = [];
         userMsg.userInputMessage.userInputMessageContext.tools = tools.map(
           (tool: KiroToolDefinition) => {
@@ -230,8 +501,10 @@ function convertMessages(messages, tools, model) {
               description = `Tool: ${name}`;
             }
 
-            if (description.length > TOOL_DESC_MAX) {
-              toolDocs.push(`## Tool: ${name}\n\n${description}`);
+            if (description.length > toolDescriptionMax) {
+              toolDocs.push(
+                `## Tool: ${name}\n\n${truncateKiroText(description, toolDescriptionMax, "tool docs truncated")}`
+              );
               description = `[Full documentation in system prompt under '## Tool: ${name}']`;
             }
 
@@ -285,7 +558,7 @@ function convertMessages(messages, tools, model) {
       } else if (Array.isArray(msg.content)) {
         const textParts = msg.content
           .filter((c) => c.type === "text" || c.text)
-          .map((c) => c.text || "");
+          .map((c) => stringifyKiroContent(c.text || c.content || c));
         content = textParts.join("\n");
 
         // Extract images (OpenAI image_url and Anthropic image formats)
@@ -310,11 +583,17 @@ function convertMessages(messages, tools, model) {
         const toolResultBlocks = msg.content.filter((c) => c.type === "tool_result");
         if (toolResultBlocks.length > 0) {
           toolResultBlocks.forEach((block) => {
-            const text = serializeToolResultContent(block.content);
+            const isError = Boolean(block.is_error);
+            const text = truncateKiroToolResult(
+              serializeToolResultContent(block.content),
+              isError ? economyProfile.errorToolResultMaxChars : economyProfile.toolResultMaxChars,
+              isError
+            );
+
             pendingToolResults.push({
               toolUseId: block.tool_use_id,
-              status: block.is_error ? "error" : "success",
-              content: [{ text: text }],
+              status: isError ? "error" : "success",
+              content: [{ text }],
             });
           });
         }
@@ -323,10 +602,12 @@ function convertMessages(messages, tools, model) {
       // Handle tool role (from normalized)
       if (msg.role === "tool") {
         // Reuse the shared serializer so non-string content (arrays, structured/JSON
-        // blocks, images) is never collapsed to an empty string. CodeWhisperer rejects a
-        // toolResult whose content is [{ text: "" }] with 400 "Improperly formed request"
-        // — the same failure mode that hit the Anthropic tool_result path (issue #2446).
-        const toolContent = serializeToolResultContent(msg.content);
+        // blocks, images) is never collapsed to an empty string, then cap size for Kiro.
+        const toolContent = truncateKiroToolResult(
+          serializeToolResultContent(msg.content),
+          economyProfile.toolResultMaxChars,
+          false
+        );
         pendingToolResults.push({
           toolUseId: msg.tool_call_id,
           status: "success",
@@ -341,9 +622,14 @@ function convertMessages(messages, tools, model) {
       let toolUses = [];
 
       if (Array.isArray(msg.content)) {
-        const textBlocks = msg.content.filter((c) => c.type === "text");
+        const textBlocks = msg.content.filter(
+          (c) => c.type === "text" || c.type === "thinking" || c.type === "redacted_thinking"
+        );
         textContent = textBlocks
-          .map((b) => b.text)
+          .map((b) =>
+            b.type === "redacted_thinking" ? "" : stringifyKiroContent(b.text || b.thinking || b)
+          )
+          .filter(Boolean)
           .join("\n")
           .trim();
 
@@ -379,14 +665,14 @@ function convertMessages(messages, tools, model) {
                 tc.id || uuidv5(`${tc.function.name}:${idx}`, NAMESPACE_KIRO_TOOLUSE);
               return {
                 toolUseId: stableId,
-                name: tc.function.name,
+                name: tc.function.name || "unknown_tool",
                 input: parseToolInput(tc.function.arguments),
               };
             } else {
               const stableId = tc.id || uuidv5(`${tc.name}:${idx}`, NAMESPACE_KIRO_TOOLUSE);
               return {
                 toolUseId: stableId,
-                name: tc.name,
+                name: tc.name || "unknown_tool",
                 input: parseToolInput(tc.input),
               };
             }
@@ -414,6 +700,7 @@ function convertMessages(messages, tools, model) {
       userInputMessage: {
         content: "Continue",
         modelId: model,
+        origin: "AI_EDITOR",
       },
     };
   }
@@ -677,7 +964,10 @@ export function buildKiroPayload(model, body, stream, credentials) {
     }
   }
   let tools = body.tools || [];
+  const economyProfile = readKiroEconomyProfile();
   const maxTokens = body.max_tokens ?? body.max_completion_tokens ?? 32000;
+  const kiroContextMaxTokens = economyProfile.contextMaxTokens;
+  const kiroContextReserveTokens = economyProfile.reserveTokens;
   const temperature = body.temperature;
   const topP = body.top_p;
 
@@ -725,16 +1015,72 @@ export function buildKiroPayload(model, body, stream, credentials) {
     }
   }
 
-  const { history, currentMessage, toolsAttached } = convertMessages(
-    messages,
-    tools,
-    normalizedModel
-  );
+  const {
+    history: rawHistory,
+    currentMessage,
+    toolsAttached,
+  } = convertMessages(messages, tools, normalizedModel, economyProfile);
+  const history = compactKiroHistoryForSavings(rawHistory, economyProfile);
 
   const profileArn = credentials?.providerSpecificData?.profileArn || "";
 
   let finalContent = currentMessage?.userInputMessage?.content || "";
+  let kiroCompressionStats: { original: number; final: number } | null = null;
   const timestamp = new Date().toISOString();
+  // Apply compression to the assembled history + currentMessage where possible
+  try {
+    const compressBody = {
+      messages: [
+        // Map merged history to simple messages for compression
+        ...(history || []).map((item: any) =>
+          item.userInputMessage
+            ? { role: "user", content: item.userInputMessage.content }
+            : item.assistantResponseMessage
+              ? { role: "assistant", content: item.assistantResponseMessage.content }
+              : { role: "user", content: "" }
+        ),
+        // currentMessage (make sure it's last)
+        currentMessage?.userInputMessage
+          ? { role: "user", content: currentMessage.userInputMessage.content }
+          : { role: "user", content: "" },
+      ],
+    };
+    const compressed = compressContext(compressBody, {
+      provider: "kiro",
+      model: normalizedModel,
+      maxTokens: kiroContextMaxTokens,
+      reserveTokens: Math.min(kiroContextReserveTokens, Math.max(0, kiroContextMaxTokens - 1)),
+    });
+    if (compressed && compressed.compressed && Array.isArray(compressed.body.messages)) {
+      kiroCompressionStats = compressionStatsFromContext(compressed.stats);
+      const msgs = compressed.body.messages as Array<Record<string, unknown>>;
+      const compressedHistory = msgs.slice(0, -1);
+      const preserveHistoryFrom = Math.max(0, history.length - economyProfile.preserveTailTurns);
+      for (let i = 0; i < compressedHistory.length && i < history.length; i++) {
+        if (i >= preserveHistoryFrom) continue;
+        const source = compressedHistory[i];
+        const target = history[i] as Record<string, unknown>;
+        if (typeof source.content !== "string") continue;
+        if (target.userInputMessage && typeof target.userInputMessage === "object") {
+          (target.userInputMessage as Record<string, unknown>).content = source.content;
+        } else if (
+          target.assistantResponseMessage &&
+          typeof target.assistantResponseMessage === "object"
+        ) {
+          (target.assistantResponseMessage as Record<string, unknown>).content = source.content;
+        }
+      }
+
+      // Use the last user message as final content after compression
+      const lastUser = [...msgs].reverse().find((m) => m.role === "user");
+      if (lastUser && typeof lastUser.content === "string") {
+        finalContent = lastUser.content;
+      }
+    }
+  } catch (_err) {
+    // Compression is best-effort; fall back to uncompressed content
+  }
+
   finalContent = `[Context: Current time is ${timestamp}]\n\n${finalContent}`;
 
   // Prepend tool documentation for tools with long descriptions (moved from toolSpecification)
@@ -763,6 +1109,12 @@ export function buildKiroPayload(model, body, stream, credentials) {
       maxTokens?: number;
       temperature?: number;
       topP?: number;
+    };
+    _omnirouteCompressionStats?: {
+      provider: "kiro";
+      originalTokens: number;
+      compressedTokens: number;
+      tokensCompressed: number;
     };
   } = {
     conversationState: {
@@ -805,9 +1157,23 @@ export function buildKiroPayload(model, body, stream, credentials) {
     payload.profileArn = profileArn;
   }
 
+  const compressionStats = kiroCompressionStats;
+  if (compressionStats) {
+    payload._omnirouteCompressionStats = {
+      provider: "kiro",
+      originalTokens: compressionStats.original,
+      compressedTokens: compressionStats.final,
+      tokensCompressed: compressionStats.original - compressionStats.final,
+    };
+  }
+
   if (maxTokens || temperature !== undefined || topP !== undefined) {
     payload.inferenceConfig = {};
-    if (maxTokens) payload.inferenceConfig.maxTokens = maxTokens;
+    if (maxTokens)
+      payload.inferenceConfig.maxTokens = Math.min(
+        maxTokens as number,
+        economyProfile.maxOutputTokens
+      );
     if (temperature !== undefined) payload.inferenceConfig.temperature = temperature;
     if (topP !== undefined) payload.inferenceConfig.topP = topP;
   }

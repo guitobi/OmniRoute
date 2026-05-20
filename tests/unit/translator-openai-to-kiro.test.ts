@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-const { buildKiroPayload } = await import("../../open-sse/translator/request/openai-to-kiro.ts");
+const { buildKiroPayload, consumeKiroCompressionStats } =
+  await import("../../open-sse/translator/request/openai-to-kiro.ts");
 
 function buildSamplePayload() {
   return buildKiroPayload(
@@ -67,7 +68,7 @@ test("OpenAI -> Kiro builds a conversation payload with deterministic structure"
   assert.equal("thinking" in result, false);
   assert.equal("context_management" in result, false);
   assert.deepEqual(result.inferenceConfig, {
-    maxTokens: 2048,
+    maxTokens: 768,
     temperature: 0.2,
     topP: 0.7,
   });
@@ -568,6 +569,220 @@ test("OpenAI -> Kiro converts orphaned tool results to text", () => {
     undefined,
     "orphaned toolResults should be removed from context"
   );
+});
+
+test("OpenAI -> Kiro truncates oversized tool results and long tool docs", () => {
+  const longToolResult = "tool-output-".repeat(400);
+  const longDescription = "tool-doc-".repeat(1000);
+
+  const result = buildKiroPayload(
+    "claude-sonnet-4",
+    {
+      messages: [
+        { role: "system", content: "System rules" },
+        { role: "user", content: "Run tool" },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "call_big", name: "big_tool", input: { q: "x" } }],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "call_big",
+              content: [{ type: "text", text: longToolResult }],
+            },
+            { type: "text", text: "Continue" },
+          ],
+        },
+      ],
+      tools: [
+        {
+          name: "big_tool",
+          description: longDescription,
+          input_schema: { type: "object", properties: { q: { type: "string" } } },
+        },
+      ],
+    },
+    false,
+    null
+  );
+
+  const currentMsg = result.conversationState.currentMessage.userInputMessage;
+  const historyText = JSON.stringify(result.conversationState.history);
+  assert.match(currentMsg.content, /Continue/);
+  assert.match(historyText, /\[tool docs truncated:/);
+  const toolResults = currentMsg.userInputMessageContext.toolResults as Array<{
+    content: Array<{ text: string }>;
+  }>;
+  assert.ok(toolResults[0].content[0].text.length < longToolResult.length);
+  assert.match(toolResults[0].content[0].text, /\[tool result truncated:/);
+});
+
+test("OpenAI -> Kiro economy profile preserves important error lines while truncating tool output", () => {
+  const previousProfile = process.env.KIRO_ECONOMY_PROFILE;
+  process.env.KIRO_ECONOMY_PROFILE = "aggressive";
+
+  try {
+    const noisyOutput = `${"noise\n".repeat(500)}Error: build failed\nsrc/app.ts:42:13 failed assertion\n${"tail\n".repeat(500)}`;
+    const result = buildKiroPayload(
+      "claude-sonnet-4",
+      {
+        messages: [
+          { role: "user", content: "Run build" },
+          {
+            role: "assistant",
+            content: [{ type: "tool_use", id: "call_build", name: "build", input: {} }],
+          },
+          {
+            role: "user",
+            content: [
+              {
+                type: "tool_result",
+                tool_use_id: "call_build",
+                is_error: true,
+                content: [{ type: "text", text: noisyOutput }],
+              },
+              { type: "text", text: "Fix it" },
+            ],
+          },
+        ],
+      },
+      false,
+      null
+    );
+
+    const toolResults = result.conversationState.currentMessage.userInputMessage
+      .userInputMessageContext.toolResults as Array<{ content: Array<{ text: string }> }>;
+    const text = toolResults[0].content[0].text;
+
+    assert.ok(text.length < noisyOutput.length);
+    assert.match(text, /Error: build failed/);
+    assert.match(text, /src\/app\.ts:42:13 failed assertion/);
+    assert.match(text, /\[tool result truncated:/);
+    assert.equal(result.inferenceConfig.maxTokens, 512);
+  } finally {
+    if (previousProfile === undefined) {
+      delete process.env.KIRO_ECONOMY_PROFILE;
+    } else {
+      process.env.KIRO_ECONOMY_PROFILE = previousProfile;
+    }
+  }
+});
+
+test("OpenAI -> Kiro compacts old history while preserving current intent and tool contracts", () => {
+  const previousProfile = process.env.KIRO_ECONOMY_PROFILE;
+  process.env.KIRO_ECONOMY_PROFILE = "aggressive";
+
+  try {
+    const messages = [
+      { role: "system", content: "System rules must stay available in compacted history" },
+    ];
+    for (let index = 0; index < 7; index++) {
+      messages.push({
+        role: "user",
+        content: `Old task ${index} details ${"noise ".repeat(160)}src/old-${index}.ts:${index + 1}`,
+      });
+      messages.push({
+        role: "assistant",
+        content: `Old answer ${index} ${"details ".repeat(120)}`,
+      });
+    }
+    messages.push({ role: "user", content: "Recent instruction: preserve this exact intent" });
+    messages.push({
+      role: "assistant",
+      tool_calls: [
+        {
+          id: "call_recent",
+          type: "function",
+          function: { name: "read_file", arguments: '{"path":"src/current.ts"}' },
+        },
+      ],
+    });
+    messages.push({ role: "tool", tool_call_id: "call_recent", content: "current file result" });
+    messages.push({ role: "user", content: "Now patch src/current.ts" });
+
+    const result = buildKiroPayload(
+      "claude-sonnet-4",
+      {
+        messages,
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "read_file",
+              description: "Read file",
+              parameters: { type: "object", properties: { path: { type: "string" } } },
+            },
+          },
+        ],
+      },
+      false,
+      null
+    );
+
+    const currentMsg = result.conversationState.currentMessage.userInputMessage;
+    const historyText = JSON.stringify(result.conversationState.history);
+
+    assert.match(historyText, /Previous conversation compacted for Kiro account savings/);
+    assert.match(historyText, /src\/old-6\.ts:7/);
+    assert.match(historyText, /call_recent/);
+    assert.match(historyText, /read_file/);
+    assert.match(historyText, /Recent instruction: preserve this exact intent/);
+    assert.match(currentMsg.content, /Now patch src\/current\.ts/);
+    assert.ok(
+      currentMsg.userInputMessageContext.tools,
+      "tools schema must stay on current message"
+    );
+  } finally {
+    if (previousProfile === undefined) {
+      delete process.env.KIRO_ECONOMY_PROFILE;
+    } else {
+      process.env.KIRO_ECONOMY_PROFILE = previousProfile;
+    }
+  }
+});
+
+test("OpenAI -> Kiro applies compact Kiro context compression to history and current message", () => {
+  const result = buildKiroPayload(
+    "claude-sonnet-4",
+    {
+      messages: [
+        { role: "system", content: "System rules" },
+        { role: "user", content: "old ".repeat(5000) },
+        { role: "assistant", content: "answer ".repeat(5000) },
+        { role: "user", content: "Final question" },
+      ],
+    },
+    false,
+    null
+  );
+
+  const payloadText = JSON.stringify(result.conversationState);
+  assert.ok(payloadText.length < 60000, "Kiro payload should be aggressively compacted");
+  assert.match(result.conversationState.currentMessage.userInputMessage.content, /Final question/);
+});
+
+test("OpenAI -> Kiro exposes and strips translator compression stats metadata", () => {
+  const result = buildKiroPayload(
+    "claude-sonnet-4",
+    {
+      messages: [
+        { role: "system", content: "System rules" },
+        { role: "user", content: "old ".repeat(5000) },
+        { role: "assistant", content: "answer ".repeat(5000) },
+        { role: "user", content: "Final question" },
+      ],
+    },
+    false,
+    null
+  ) as Record<string, unknown>;
+
+  const stats = consumeKiroCompressionStats(result);
+  assert.ok(stats, "Kiro translator compression stats should be exposed for logging");
+  assert.ok(stats.tokensCompressed > 0);
+  assert.equal(result._omnirouteCompressionStats, undefined);
 });
 
 test("OpenAI -> Kiro includes origin on all history user messages", () => {

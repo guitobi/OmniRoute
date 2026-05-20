@@ -2,6 +2,7 @@ import { CORS_HEADERS } from "../utils/cors.ts";
 import { detectFormatFromEndpoint, getTargetFormat } from "../services/provider.ts";
 import { injectSystemPrompt } from "../services/systemPrompt.ts";
 import { translateRequest, needsTranslation } from "../translator/index.ts";
+import { consumeKiroCompressionStats } from "../translator/request/openai-to-kiro.ts";
 import { FORMATS } from "../translator/formats.ts";
 import {
   createSSETransformStreamWithLogger,
@@ -2609,6 +2610,17 @@ export async function handleChatCore({
   }
 
   let translatedBody = body;
+  const consumeTranslatorCompressionStats = (payload: unknown): void => {
+    if (provider !== "kiro") return;
+    const stats = consumeKiroCompressionStats(payload);
+    if (!stats) return;
+
+    tokensCompressed = Math.max(tokensCompressed ?? 0, Math.floor(stats.tokensCompressed));
+    log?.info?.(
+      "COMPRESSION",
+      `Translator compression (kiro): ${stats.originalTokens} -> ${stats.compressedTokens} tokens`
+    );
+  };
   const isClaudePassthrough = sourceFormat === FORMATS.CLAUDE && targetFormat === FORMATS.CLAUDE;
   const isClaudeCodeCompatible = isClaudeCodeCompatibleProvider(provider);
   const isClaudeCodeSemanticPassthrough = isClaudeCodeSemanticPassthroughRequest({
@@ -2966,6 +2978,7 @@ export async function handleChatCore({
           signatureNamespace: connectionId,
         }
       );
+      consumeTranslatorCompressionStats(translatedBody);
     }
   } catch (error) {
     const parsedStatus = Number(error?.statusCode);
