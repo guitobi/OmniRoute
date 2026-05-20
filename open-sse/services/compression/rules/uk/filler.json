@@ -1,0 +1,66 @@
+{
+  "language": "uk",
+  "category": "filler",
+  "rules": [
+    {
+      "name": "pleasantries_uk",
+      "pattern": "(?<!\")\\b(?:дякую|спасибі|вдячний|вдячна|дякую заздалегідь|не за що|рад допомогти)\\b[,.!?\\s]*",
+      "flags": "giu",
+      "replacement": "",
+      "context": "all",
+      "category": "filler",
+      "minIntensity": "lite",
+      "description": "Remove common polite phrases in Ukrainian Cyrillic text."
+    },
+    {
+      "name": "collapse_repeated_pleasantries_uk",
+      "pattern": "(\\b(?:будь ласка|дякую|я б дуже вдячний|не могли б ви)\\b)(?:[\\s,]+\\1)+",
+      "flags": "giu",
+      "replacement": "$1 ",
+      "context": "all",
+      "category": "dedup",
+      "minIntensity": "full",
+      "description": "Collapse adjacent repeated polite phrases into a single occurrence."
+    },
+    {
+      "name": "polite_framing_uk",
+      "pattern": "\\b(?:не могли б ви|можете, будь ласка|будь ласка, зробіть|прошую вас)\\b\\s*",
+      "flags": "giu",
+      "replacement": "",
+      "context": "user",
+      "category": "filler",
+      "minIntensity": "lite",
+      "description": "Strip polite framing from user requests in Ukrainian."
+    },
+    {
+      "name": "hedging_uk",
+      "pattern": "\\b(?:можливо|ймовірно|мабуть|схоже|мені здається|я вважаю)\\b\\s*",
+      "flags": "giu",
+      "replacement": "",
+      "context": "all",
+      "category": "filler",
+      "minIntensity": "lite",
+      "description": "Remove hedging words common in Ukrainian."
+    },
+    {
+      "name": "greetings_uk",
+      "pattern": "^(?:добрий день|добрий ранок|добрий вечір|привіт|здоровенькі були)\\s*[,.!?\\s]?\\s*",
+      "flags": "giu",
+      "replacement": "",
+      "context": "user",
+      "category": "filler",
+      "minIntensity": "lite",
+      "description": "Strip common Ukrainian greetings."
+    },
+    {
+      "name": "filler_adverbs_uk",
+      "pattern": "\\b(?:в принципі|по суті|фактично|в основному|просто)\\b\\s*",
+      "flags": "giu",
+      "replacement": "",
+      "context": "all",
+      "category": "filler",
+      "minIntensity": "lite",
+      "description": "Remove filler adverbs/phrases in Ukrainian."
+    }
+  ]
+}

@@ -123,6 +123,8 @@
     "check": "npm run lint && npm run test",
     "prepublishOnly": "npm run build:cli-api && npm run build:cli && npm run check:pack-artifact",
     "postinstall": "node scripts/build/postinstall.mjs",
+    "run:compression:uk": "node --import tsx/esm scripts/run-compression-uk.mjs",
+    "bench:compression:uk": "node --import tsx/esm scripts/bench-compression-uk.mjs",
     "uninstall": "node scripts/build/uninstall.mjs",
     "uninstall:full": "node scripts/build/uninstall.mjs --full",
     "prepare": "husky",

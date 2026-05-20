@@ -11,6 +11,7 @@ type KiroAuthModalProps = {
   providerLabel?: string;
   onMethodSelect: (method: string, config?: Record<string, unknown>) => void;
   onClose: () => void;
+  reauthConnection?: null | { id?: string };
 };
 
 /**
@@ -23,6 +24,7 @@ export default function KiroAuthModal({
   providerLabel = "Kiro",
   onMethodSelect,
   onClose,
+  reauthConnection,
 }: KiroAuthModalProps) {
   const [selectedMethod, setSelectedMethod] = useState(null);
   const [idcStartUrl, setIdcStartUrl] = useState("");
@@ -89,7 +91,10 @@ export default function KiroAuthModal({
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ refreshToken: refreshToken.trim() }),
+          body: JSON.stringify({
+            refreshToken: refreshToken.trim(),
+            ...(reauthConnection?.id ? { connectionId: reauthConnection.id } : {}),
+          }),
         }
       );
 

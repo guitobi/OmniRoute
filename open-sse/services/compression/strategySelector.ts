@@ -20,6 +20,26 @@ import {
   type CachingDetectionContext,
 } from "./cachingAware.ts";
 
+// Providers that must fully bypass compression (format too strict to touch)
+const COMPRESSION_BYPASS_PROVIDERS = new Set(["amazon-q"]);
+
+// Providers capped at "lite" — heavier modes risk breaking their request format
+const COMPRESSION_LITE_CAP_PROVIDERS = new Set(["kiro"]);
+
+export function shouldBypassCompressionForProvider(
+  provider?: string | null,
+  targetFormat?: string | null
+): boolean {
+  const normalizedProvider = typeof provider === "string" ? provider.trim().toLowerCase() : "";
+  const normalizedTargetFormat =
+    typeof targetFormat === "string" ? targetFormat.trim().toLowerCase() : "";
+
+  return (
+    COMPRESSION_BYPASS_PROVIDERS.has(normalizedProvider) ||
+    COMPRESSION_BYPASS_PROVIDERS.has(normalizedTargetFormat)
+  );
+}
+
 export function checkComboOverride(
   config: CompressionConfig,
   comboId: string | null
@@ -59,6 +79,19 @@ export function selectCompressionStrategy(
   // Apply caching-aware adjustments if body is provided
   if (body) {
     const ctx = detectCachingContext(body, context);
+    if (shouldBypassCompressionForProvider(ctx.provider, ctx.targetFormat)) {
+      return "off";
+    }
+    // Kiro: cap at "lite" — heavier modes risk corrupting conversationState format
+    const provider = ctx.provider ?? "";
+    const targetFormat = ctx.targetFormat ?? "";
+    if (
+      COMPRESSION_LITE_CAP_PROVIDERS.has(provider) ||
+      COMPRESSION_LITE_CAP_PROVIDERS.has(targetFormat)
+    ) {
+      const LITE_CAP_MODES: CompressionMode[] = ["off", "lite"];
+      return LITE_CAP_MODES.includes(selectedMode) ? selectedMode : "lite";
+    }
     const cacheAware = getCacheAwareStrategy(selectedMode, ctx);
     return cacheAware.strategy as CompressionMode;
   }

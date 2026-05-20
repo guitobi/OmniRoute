@@ -590,3 +590,69 @@ test("OpenAI -> Kiro includes origin on all history user messages", () => {
   // Note: last user message becomes currentMessage, not history
   assert.equal(history.length, 2);
 });
+
+test("OpenAI -> Kiro injects body.system array into conversation when no system role present", () => {
+  // Simulates Claude Code sending via /v1/chat/completions with Claude-format body.
+  // Use multi-turn so system ends up in history (not just currentMessage).
+  const result = buildKiroPayload(
+    "kiro/claude-sonnet-4.5",
+    {
+      system: [{ type: "text", text: "You are a helpful assistant." }],
+      messages: [
+        { role: "user", content: "Hello" },
+        { role: "assistant", content: "Hi" },
+        { role: "user", content: "How are you?" },
+      ],
+      max_tokens: 1024,
+    },
+    true,
+    null
+  );
+
+  const allContent = JSON.stringify(result.conversationState);
+  assert.ok(
+    allContent.includes("You are a helpful assistant."),
+    `Expected system prompt in conversation, got: ${allContent.substring(0, 300)}`
+  );
+});
+
+test("OpenAI -> Kiro injects body.system string into conversation when no system role present", () => {
+  const result = buildKiroPayload(
+    "kiro/claude-sonnet-4.5",
+    {
+      system: "Be concise.",
+      messages: [
+        { role: "user", content: "Hi" },
+        { role: "assistant", content: "Hello" },
+        { role: "user", content: "Question?" },
+      ],
+    },
+    true,
+    null
+  );
+
+  const allContent = JSON.stringify(result.conversationState);
+  assert.ok(
+    allContent.includes("Be concise."),
+    `Expected system string in conversation, got: ${allContent.substring(0, 300)}`
+  );
+});
+
+test("OpenAI -> Kiro does not duplicate system when messages already has system role", () => {
+  const result = buildKiroPayload(
+    "claude-sonnet-4",
+    {
+      system: "Extra system",
+      messages: [
+        { role: "system", content: "Original system" },
+        { role: "user", content: "Hello" },
+      ],
+    },
+    false,
+    null
+  );
+
+  const allContent = JSON.stringify(result.conversationState);
+  assert.ok(allContent.includes("Original system"), "Original system should be present");
+  assert.ok(!allContent.includes("Extra system"), "Extra system should not be duplicated");
+});

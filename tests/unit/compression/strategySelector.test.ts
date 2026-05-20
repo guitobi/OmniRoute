@@ -6,6 +6,7 @@ import {
   applyCompression,
   checkComboOverride,
   shouldAutoTrigger,
+  shouldBypassCompressionForProvider,
 } from "../../../open-sse/services/compression/strategySelector.ts";
 import type { CompressionConfig } from "../../../open-sse/services/compression/types.ts";
 
@@ -110,6 +111,36 @@ describe("selectCompressionStrategy", () => {
     assert.equal(selectCompressionStrategy(baseConfig, null, 100), "lite");
   });
 
+  it("caps compression at lite for Kiro providers (aggressive → lite)", () => {
+    const config = { ...baseConfig, defaultMode: "aggressive" as const };
+    const body = {
+      messages: [{ role: "user", content: "keep this intact" }],
+    };
+
+    assert.equal(
+      selectCompressionStrategy(config, null, 100, body, {
+        provider: "kiro",
+        targetFormat: "kiro",
+        model: "claude-sonnet-4.6",
+      }),
+      "lite"
+    );
+  });
+
+  it("allows off mode for Kiro when compression is disabled", () => {
+    const config = { ...baseConfig, enabled: false, defaultMode: "off" as const };
+    const body = { messages: [{ role: "user", content: "hi" }] };
+
+    assert.equal(
+      selectCompressionStrategy(config, null, 100, body, {
+        provider: "kiro",
+        targetFormat: "kiro",
+        model: "claude-sonnet-4.6",
+      }),
+      "off"
+    );
+  });
+
   it("downgrades aggressive cache-control requests for caching-aware providers", () => {
     const config = { ...baseConfig, defaultMode: "aggressive" as const };
     const body = {
@@ -129,6 +160,21 @@ describe("selectCompressionStrategy", () => {
       }),
       "standard"
     );
+  });
+});
+
+describe("shouldBypassCompressionForProvider", () => {
+  it("returns true for amazon-q provider id", () => {
+    assert.equal(shouldBypassCompressionForProvider("amazon-q", null), true);
+  });
+
+  it("returns false for kiro (kiro is lite-capped, not bypassed)", () => {
+    assert.equal(shouldBypassCompressionForProvider("kiro", null), false);
+    assert.equal(shouldBypassCompressionForProvider(null, "kiro"), false);
+  });
+
+  it("returns false for unrelated providers", () => {
+    assert.equal(shouldBypassCompressionForProvider("anthropic", "claude"), false);
   });
 });
 
