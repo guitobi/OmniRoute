@@ -7,6 +7,10 @@ import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import { v1RerankSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody, getValidationError } from "@/shared/validation/helpers";
 import { getProviderNodes } from "@/lib/localDb";
+import {
+  isAllRateLimitedCredentials,
+  rateLimitedProviderResponse,
+} from "@/app/api/v1/_shared/rateLimit";
 
 /**
  * Handle CORS preflight
@@ -102,6 +106,9 @@ export async function POST(request) {
     if (!credentials) {
       return errorResponse(HTTP_STATUS.BAD_REQUEST, `No credentials for provider: ${provider}`);
     }
+    if (isAllRateLimitedCredentials(credentials)) {
+      return rateLimitedProviderResponse(provider, credentials);
+    }
 
     const response = await handleRerank({
       model: body.model,
@@ -131,6 +138,9 @@ export async function POST(request) {
           HTTP_STATUS.BAD_REQUEST,
           `No credentials for local provider: ${prefix}`
         );
+      }
+      if (isAllRateLimitedCredentials(credentials)) {
+        return rateLimitedProviderResponse(prefix, credentials);
       }
 
       const token = credentials?.apiKey || credentials?.accessToken;

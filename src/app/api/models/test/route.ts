@@ -7,6 +7,7 @@ import { buildComboTestRequestBody, extractComboTestResponseText } from "@/lib/c
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { getCustomModels } from "@/lib/localDb";
 import { isValidationFailure, validateBody, getValidationError } from "@/shared/validation/helpers";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 import { z } from "zod";
 
 const testModelSchema = z.object({
@@ -24,8 +25,7 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 function getErrorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  return typeof error === "string" ? error : "Unknown error";
+  return sanitizeErrorMessage(error) || "Unknown error";
 }
 
 function getErrorName(error: unknown): string {

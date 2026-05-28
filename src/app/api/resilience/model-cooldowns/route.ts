@@ -7,6 +7,8 @@ import {
 } from "@/domain/modelAvailability";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { isValidationFailure, validateBody, getValidationError } from "@/shared/validation/helpers";
+import { validateBody } from "@/shared/validation/helpers";
+import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 
 const deleteCooldownSchema = z
   .object({
@@ -17,7 +19,7 @@ const deleteCooldownSchema = z
   .passthrough();
 
 function getErrorMessage(error: unknown, fallback: string): string {
-  return error instanceof Error && error.message ? error.message : fallback;
+  return sanitizeErrorMessage(error) || fallback;
 }
 
 export async function GET(request: Request) {
