@@ -1,11 +1,13 @@
 import http from "node:http";
 import { randomUUID } from "node:crypto";
 import { createResponsesWsProxy } from "./responses-ws-proxy.mjs";
+import { attachFreebuffConnectMitm } from "./freebuff-connect-mitm.mjs";
 
 const originalCreateServer = http.createServer.bind(http);
 const proxiesByPort = new Map();
 
 process.env.OMNIROUTE_WS_BRIDGE_SECRET ||= randomUUID();
+process.env.OMNIROUTE_FREEBUFF_MITM_SECRET ||= randomUUID();
 
 function getPort(server) {
   const address = server.address?.();
@@ -47,6 +49,9 @@ function wrapUpgradeListener(server, listener) {
 
 http.createServer = function createServerWithResponsesWs(...args) {
   const server = originalCreateServer(...args);
+  attachFreebuffConnectMitm(server, {
+    secret: process.env.OMNIROUTE_FREEBUFF_MITM_SECRET,
+  });
   const originalOn = server.on.bind(server);
   const originalAddListener = server.addListener.bind(server);
 

@@ -8,6 +8,7 @@ import { bootstrapEnv } from "../build/bootstrap-env.mjs";
 import { resolveRuntimePorts, withRuntimePortEnv } from "../build/runtime-env.mjs";
 import { createOmnirouteWsBridge } from "./v1-ws-bridge.mjs";
 import { createResponsesWsProxy } from "./responses-ws-proxy.mjs";
+import { attachFreebuffConnectMitm } from "./freebuff-connect-mitm.mjs";
 import { randomUUID } from "node:crypto";
 
 // Pre-read DATA_DIR from local .env before bootstrap resolves paths
@@ -49,6 +50,7 @@ const { dashboardPort } = runtimePorts;
 const hostname = process.env.HOST || "0.0.0.0";
 const useTurbopack = dev && mergedEnv.OMNIROUTE_USE_TURBOPACK === "1";
 process.env.OMNIROUTE_WS_BRIDGE_SECRET ||= randomUUID();
+process.env.OMNIROUTE_FREEBUFF_MITM_SECRET ||= randomUUID();
 
 const nextApp = next({
   dev,
@@ -72,6 +74,10 @@ async function start() {
   });
 
   const server = http.createServer((req, res) => requestHandler(req, res));
+  attachFreebuffConnectMitm(server, {
+    port: dashboardPort,
+    secret: process.env.OMNIROUTE_FREEBUFF_MITM_SECRET,
+  });
   server.on("upgrade", async (req, socket, head) => {
     try {
       const responsesWsHandled = await responsesWsProxy.handleUpgrade(req, socket, head);

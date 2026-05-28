@@ -236,6 +236,21 @@ export async function syncStandaloneExtraModules(
       destRelative: path.join("dev", "run-standalone.mjs"),
     },
     {
+      label: "standalone server wrapper",
+      sourcePath: path.join(rootDir, "scripts", "dev", "standalone-server-ws.mjs"),
+      destRelative: "server-ws.mjs",
+    },
+    {
+      label: "responses WebSocket proxy",
+      sourcePath: path.join(rootDir, "scripts", "dev", "responses-ws-proxy.mjs"),
+      destRelative: "responses-ws-proxy.mjs",
+    },
+    {
+      label: "Freebuff CONNECT MITM",
+      sourcePath: path.join(rootDir, "scripts", "dev", "freebuff-connect-mitm.mjs"),
+      destRelative: "freebuff-connect-mitm.mjs",
+    },
+    {
       label: "runtime-env script",
       sourcePath: path.join(rootDir, "scripts", "build", "runtime-env.mjs"),
       destRelative: path.join("build", "runtime-env.mjs"),

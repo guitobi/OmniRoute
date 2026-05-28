@@ -30,6 +30,8 @@
     "scripts/build/postinstallSupport.mjs",
     "scripts/build/sync-env.mjs",
     "scripts/dev/responses-ws-proxy.mjs",
+    "scripts/dev/freebuff-connect-mitm.mjs",
+    "scripts/dev/standalone-server-ws.mjs",
     "scripts/check/check-supported-node-runtime.ts",
     "scripts/dev/sync-env.mjs",
     "scripts/build/native-binary-compat.mjs",

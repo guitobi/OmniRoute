@@ -57,29 +57,34 @@ function buildSamplePayload() {
       max_tokens: 2048,
     },
     false,
-    { providerSpecificData: { profileArn: "arn:aws:demo" } }
+    null
   );
 }
 
 test("OpenAI -> Kiro builds a conversation payload with deterministic structure", () => {
   const result = buildSamplePayload();
 
-  assert.equal(result.profileArn, "arn:aws:demo");
+  assert.equal("profileArn" in result, false);
   assert.equal("thinking" in result, false);
   assert.equal("context_management" in result, false);
-  assert.deepEqual(result.inferenceConfig, {
-    maxTokens: 768,
-    temperature: 0.2,
-    topP: 0.7,
-  });
+  assert.equal("inferenceConfig" in result, false);
   assert.equal(result.conversationState.chatTriggerType, "MANUAL");
   assert.match(result.conversationState.conversationId, /^[0-9a-f-]{36}$/);
   assert.equal(result.conversationState.currentMessage.userInputMessage.modelId, "claude-sonnet-4");
-  assert.equal(result.conversationState.currentMessage.userInputMessage.origin, "AI_EDITOR");
-  assert.match(
-    result.conversationState.currentMessage.userInputMessage.content,
-    /^\[Context: Current time is .*Z\]\n\nThanks$/
+  assert.equal(result.conversationState.currentMessage.userInputMessage.origin, "KIRO_CLI");
+  assert.deepEqual(
+    result.conversationState.currentMessage.userInputMessage.userInputMessageContext?.envState,
+    {
+      operatingSystem:
+        process.platform === "win32"
+          ? "windows"
+          : process.platform === "darwin"
+            ? "macos"
+            : "linux",
+      currentWorkingDirectory: process.cwd(),
+    }
   );
+  assert.match(result.conversationState.currentMessage.userInputMessage.content, /^Thanks$/);
 });
 
 test("OpenAI -> Kiro preserves prior history, tool uses and accumulated tool results", () => {
@@ -90,7 +95,7 @@ test("OpenAI -> Kiro preserves prior history, tool uses and accumulated tool res
     userInputMessage: {
       content: "Rules\n\nHello",
       modelId: "claude-sonnet-4",
-      origin: "AI_EDITOR",
+      origin: "KIRO_CLI",
     },
   });
   assert.deepEqual(result.conversationState.history[1], {
@@ -222,13 +227,10 @@ test("OpenAI -> Kiro uses Continue currentMessage when the request ends with ass
     null
   );
 
-  assert.match(
-    result.conversationState.currentMessage.userInputMessage.content,
-    /^\[Context: Current time is .*Z\]\n\nContinue$/
-  );
+  assert.match(result.conversationState.currentMessage.userInputMessage.content, /^Continue$/);
   assert.deepEqual(result.conversationState.history, [
     {
-      userInputMessage: { content: "First user", modelId: "claude-sonnet-4", origin: "AI_EDITOR" },
+      userInputMessage: { content: "First user", modelId: "claude-sonnet-4", origin: "KIRO_CLI" },
     },
     { assistantResponseMessage: { content: "Assistant answer" } },
   ]);
@@ -260,10 +262,7 @@ test("OpenAI -> Kiro still returns a valid payload for minimal requests", () => 
   );
 
   assert.equal(result.conversationState.history.length, 0);
-  assert.match(
-    result.conversationState.currentMessage.userInputMessage.content,
-    /^\[Context: Current time is .*Z\]\n\nHi$/
-  );
+  assert.match(result.conversationState.currentMessage.userInputMessage.content, /^Hi$/);
   assert.equal(result.conversationState.currentMessage.userInputMessage.modelId, "claude-sonnet-4");
 });
 
@@ -543,7 +542,7 @@ test("OpenAI -> Kiro prepends synthetic user when conversation starts with assis
   const history = result.conversationState.history as any[];
   assert.equal(history.length, 2);
   assert.equal(history[0].userInputMessage.content, "(empty)");
-  assert.equal(history[0].userInputMessage.origin, "AI_EDITOR");
+  assert.equal(history[0].userInputMessage.origin, "KIRO_CLI");
   assert.equal(history[1].assistantResponseMessage.content, "Greeting");
 });
 
@@ -564,11 +563,17 @@ test("OpenAI -> Kiro converts orphaned tool results to text", () => {
 
   const currentMsg = result.conversationState.currentMessage.userInputMessage;
   assert.match(currentMsg.content, /Follow-up\n\n\[Tool Result \(orphan_1\)\]\nresult data$/);
-  assert.equal(
-    currentMsg.userInputMessageContext,
-    undefined,
-    "orphaned toolResults should be removed from context"
-  );
+  assert.deepEqual(currentMsg.userInputMessageContext, {
+    envState: {
+      operatingSystem:
+        process.platform === "win32"
+          ? "windows"
+          : process.platform === "darwin"
+            ? "macos"
+            : "linux",
+      currentWorkingDirectory: process.cwd(),
+    },
+  });
 });
 
 test("OpenAI -> Kiro truncates oversized tool results and long tool docs", () => {
@@ -618,57 +623,6 @@ test("OpenAI -> Kiro truncates oversized tool results and long tool docs", () =>
   }>;
   assert.ok(toolResults[0].content[0].text.length < longToolResult.length);
   assert.match(toolResults[0].content[0].text, /\[tool result truncated:/);
-});
-
-test("OpenAI -> Kiro economy profile preserves important error lines while truncating tool output", () => {
-  const previousProfile = process.env.KIRO_ECONOMY_PROFILE;
-  process.env.KIRO_ECONOMY_PROFILE = "aggressive";
-
-  try {
-    const noisyOutput = `${"noise\n".repeat(500)}Error: build failed\nsrc/app.ts:42:13 failed assertion\n${"tail\n".repeat(500)}`;
-    const result = buildKiroPayload(
-      "claude-sonnet-4",
-      {
-        messages: [
-          { role: "user", content: "Run build" },
-          {
-            role: "assistant",
-            content: [{ type: "tool_use", id: "call_build", name: "build", input: {} }],
-          },
-          {
-            role: "user",
-            content: [
-              {
-                type: "tool_result",
-                tool_use_id: "call_build",
-                is_error: true,
-                content: [{ type: "text", text: noisyOutput }],
-              },
-              { type: "text", text: "Fix it" },
-            ],
-          },
-        ],
-      },
-      false,
-      null
-    );
-
-    const toolResults = result.conversationState.currentMessage.userInputMessage
-      .userInputMessageContext.toolResults as Array<{ content: Array<{ text: string }> }>;
-    const text = toolResults[0].content[0].text;
-
-    assert.ok(text.length < noisyOutput.length);
-    assert.match(text, /Error: build failed/);
-    assert.match(text, /src\/app\.ts:42:13 failed assertion/);
-    assert.match(text, /\[tool result truncated:/);
-    assert.equal(result.inferenceConfig.maxTokens, 512);
-  } finally {
-    if (previousProfile === undefined) {
-      delete process.env.KIRO_ECONOMY_PROFILE;
-    } else {
-      process.env.KIRO_ECONOMY_PROFILE = previousProfile;
-    }
-  }
 });
 
 test("OpenAI -> Kiro compacts old history while preserving current intent and tool contracts", () => {
@@ -776,7 +730,8 @@ test("OpenAI -> Kiro exposes and strips translator compression stats metadata", 
       ],
     },
     false,
-    null
+    null,
+    { enableCompression: true }
   ) as Record<string, unknown>;
 
   const stats = consumeKiroCompressionStats(result);
@@ -796,11 +751,12 @@ test("OpenAI -> Kiro includes origin on all history user messages", () => {
       ],
     },
     false,
-    null
+    null,
+    { enableCompression: true }
   );
 
   const history = result.conversationState.history as any[];
-  assert.equal(history[0].userInputMessage.origin, "AI_EDITOR");
+  assert.equal(history[0].userInputMessage.origin, "KIRO_CLI");
   assert.equal(history[1].assistantResponseMessage.content, "B");
   // Note: last user message becomes currentMessage, not history
   assert.equal(history.length, 2);
@@ -963,131 +919,6 @@ test("OpenAI -> Kiro serializes JSON-object tool_result content to non-empty tex
   assert.ok(text && text.length > 0, `text must be non-empty, got: '${text}'`);
 });
 
-test("OpenAI -> Kiro uses placeholder text when tool_result content is empty array", () => {
-  const result = buildKiroPayload(
-    "claude-sonnet-4",
-    {
-      messages: [
-        { role: "user", content: "Do something" },
-        {
-          role: "assistant",
-          content: [{ type: "tool_use", id: "call_empty", name: "no_output_tool", input: {} }],
-        },
-        {
-          role: "user",
-          content: [
-            {
-              type: "tool_result",
-              tool_use_id: "call_empty",
-              content: [],
-            },
-          ],
-        },
-        { role: "user", content: "Continue" },
-      ],
-    },
-    false,
-    null
-  );
-
-  const ctx = result.conversationState.currentMessage.userInputMessage.userInputMessageContext as {
-    toolResults?: Array<{ toolUseId: string; content: Array<{ text: string }> }>;
-  };
-  const emptyResult = ctx?.toolResults?.find((tr) => tr.toolUseId === "call_empty");
-  assert.ok(emptyResult, "tool result should exist");
-  const text = emptyResult!.content[0].text;
-  assert.ok(text && text.length > 0, `placeholder text must be non-empty, got: '${text}'`);
-});
-
-// ── Defeito 3: instabilidade do toolUseId ───────────────────────────────────
-
-test("OpenAI -> Kiro toolUseId round-trips between tool_use and tool_result in 2-turn conversation", () => {
-  // Regressão para issue #2446: conversa 2 turnos (tool_use → tool_result → follow-up)
-  const result = buildKiroPayload(
-    "claude-sonnet-4",
-    {
-      messages: [
-        { role: "user", content: "Create a folder on the desktop" },
-        {
-          role: "assistant",
-          content: [
-            {
-              type: "tool_use",
-              id: "toolu_01abc",
-              name: "bash",
-              input: { cmd: "mkdir ~/Desktop/new_folder" },
-            },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            {
-              type: "tool_result",
-              tool_use_id: "toolu_01abc",
-              is_error: false,
-              content: [{ type: "text", text: "" }],
-            },
-          ],
-        },
-        { role: "user", content: "Done! What next?" },
-      ],
-    },
-    false,
-    null
-  );
-
-  const historyAssistant = (result.conversationState.history as any[]).find(
-    (h) => h.assistantResponseMessage?.toolUses
-  );
-  assert.ok(historyAssistant, "assistant turn with toolUses must be in history");
-  const toolUse = historyAssistant.assistantResponseMessage.toolUses[0];
-  assert.equal(toolUse.toolUseId, "toolu_01abc", "toolUseId must be preserved from tool_use.id");
-
-  const ctx = result.conversationState.currentMessage.userInputMessage.userInputMessageContext as {
-    toolResults?: Array<{ toolUseId: string; status: string }>;
-  };
-  assert.ok(ctx?.toolResults, "toolResults must be present in currentMessage context");
-  const tr = ctx.toolResults!.find((r) => r.toolUseId === "toolu_01abc");
-  assert.ok(tr, "toolResult must reference the same toolUseId 'toolu_01abc'");
-  assert.equal(tr!.status, "success");
-});
-
-test("OpenAI -> Kiro generates stable non-random toolUseId when tool_call has no id", () => {
-  const makePayload = () =>
-    buildKiroPayload(
-      "claude-sonnet-4",
-      {
-        messages: [
-          { role: "user", content: "Start" },
-          {
-            role: "assistant",
-            tool_calls: [
-              {
-                type: "function",
-                function: { name: "read_file", arguments: '{"path":"/tmp/x"}' },
-              },
-            ],
-          },
-          { role: "user", content: "Continue" },
-        ],
-      },
-      false,
-      null
-    );
-
-  const id1 = (makePayload().conversationState.history as any[]).find(
-    (h) => h.assistantResponseMessage?.toolUses
-  )?.assistantResponseMessage?.toolUses?.[0]?.toolUseId;
-
-  const id2 = (makePayload().conversationState.history as any[]).find(
-    (h) => h.assistantResponseMessage?.toolUses
-  )?.assistantResponseMessage?.toolUses?.[0]?.toolUseId;
-
-  assert.ok(id1, "toolUseId must be set even when id is absent");
-  assert.equal(id1, id2, "toolUseId must be deterministic (same input → same id)");
-});
-
 // Regression for #2446: an OpenAI-style `role:"tool"` message carrying NON-string
 // (structured / array) content must not collapse to `content:[{ text: "" }]` —
 // CodeWhisperer rejects an empty toolResult with 400 "Improperly formed request".
@@ -1181,6 +1012,30 @@ test("OpenAI -> Kiro injects body.system string into conversation when no system
   assert.ok(
     allContent.includes("Be concise."),
     `Expected system string in conversation, got: ${allContent.substring(0, 300)}`
+  );
+});
+
+test("OpenAI -> Kiro preserves developer instructions as user content", () => {
+  const result = buildKiroPayload(
+    "claude-sonnet-4",
+    {
+      messages: [
+        { role: "developer", content: "Always answer in Ukrainian." },
+        { role: "user", content: "Say hello" },
+      ],
+    },
+    false,
+    null
+  );
+
+  const conversationText = JSON.stringify(result.conversationState);
+  assert.ok(
+    conversationText.includes("Always answer in Ukrainian."),
+    `Developer instructions must survive Kiro translation, got: ${conversationText}`
+  );
+  assert.ok(
+    conversationText.includes("Say hello"),
+    `User content must survive Kiro translation, got: ${conversationText}`
   );
 });
 

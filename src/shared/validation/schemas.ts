@@ -262,6 +262,37 @@ function validateProviderSpecificData(
       });
     }
   }
+
+  const listenPort = data.listenPort;
+  if (listenPort !== undefined && listenPort !== null) {
+    if (
+      typeof listenPort !== "number" ||
+      !Number.isInteger(listenPort) ||
+      listenPort < 1 ||
+      listenPort > 65535
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "providerSpecificData.listenPort must be an integer from 1 to 65535",
+        path: ["listenPort"],
+      });
+    }
+  }
+
+  const overrideTier = data.overrideTier;
+  if (overrideTier !== undefined && overrideTier !== null) {
+    if (
+      typeof overrideTier !== "string" ||
+      overrideTier.trim().length === 0 ||
+      overrideTier.length > 64
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "providerSpecificData.overrideTier must be a non-empty string up to 64 chars",
+        path: ["overrideTier"],
+      });
+    }
+  }
 }
 
 // Re-export validation helpers from dedicated module to avoid webpack barrel-file

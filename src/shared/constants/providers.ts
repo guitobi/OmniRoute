@@ -402,6 +402,19 @@ export const WEB_COOKIE_PROVIDERS: Record<string, any> = {
 
 // API Key Providers
 export const APIKEY_PROVIDERS: Record<string, any> = {
+  freebuff: {
+    id: "freebuff",
+    alias: "freebuff",
+    name: "Freebuff",
+    icon: "router",
+    color: "#2563EB",
+    textIcon: "FB",
+    website: "https://www.codebuff.com",
+    authHint:
+      "Local interceptor for Freebuff CLI traffic. No API key required; configure listen port and mock access tier.",
+    apiHint:
+      "Point the freebuff CLI at OmniRoute (default http://localhost:20128) to unlock local session mocks and proxy all other traffic upstream.",
+  },
   agentrouter: {
     id: "agentrouter",
     alias: "agentrouter",
@@ -2765,6 +2778,7 @@ export function providerAllowsOptionalApiKey(providerId: unknown): boolean {
     providerId === "huggingchat" ||
     providerId === "gitlawb" ||
     providerId === "gitlawb-gmi" ||
+    providerId === "freebuff" ||
     isLocalProvider(providerId) ||
     isSelfHostedChatProvider(providerId) ||
     isOpenAICompatibleProvider(providerId) ||
@@ -2789,6 +2803,7 @@ const BULK_API_KEY_EXCLUDED = new Set([
   "qoder",
   "google-pse-search",
   "command-code",
+  "freebuff",
   "azure",
   "cloudflare-ai",
 ]);

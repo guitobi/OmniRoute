@@ -3,6 +3,7 @@ const CLAUDE_CODE_COMPATIBLE_PROVIDER_PREFIX = "anthropic-compatible-cc-";
 
 import { normalizeExcludedModelPatterns } from "@/domain/connectionModelRules";
 import { normalizeRoutingTags } from "@/domain/tagRouter";
+import { FREEBUFF_PROVIDER_ID, normalizeFreebuffConnectionConfig } from "./freebuff";
 
 export const CODEX_REASONING_EFFORT_VALUES = ["none", "low", "medium", "high", "xhigh"] as const;
 
@@ -105,6 +106,12 @@ export function normalizeProviderSpecificData(
   if (Object.keys(record).length === 0) return undefined;
 
   const normalized: JsonRecord = { ...record };
+
+  if (provider === FREEBUFF_PROVIDER_ID) {
+    const freebuffConfig = normalizeFreebuffConnectionConfig(normalized);
+    normalized.listenPort = freebuffConfig.listenPort;
+    normalized.overrideTier = freebuffConfig.overrideTier;
+  }
 
   if ("requestDefaults" in normalized) {
     const requestDefaults = normalizeRequestDefaults(provider, normalized.requestDefaults);

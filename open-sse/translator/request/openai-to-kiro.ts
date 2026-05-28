@@ -11,6 +11,24 @@ const KIRO_DEFAULT_CONTEXT_MAX_TOKENS = 16000;
 const KIRO_DEFAULT_CONTEXT_RESERVE_TOKENS = 4096;
 const KIRO_DEFAULT_TOOL_RESULT_MAX_CHARS = 2000;
 const KIRO_DEFAULT_TOOL_DOC_MAX_CHARS = 6000;
+const KIRO_USER_ORIGIN = "KIRO_CLI";
+
+function getKiroOperatingSystem(): string {
+  if (process.platform === "win32") return "windows";
+  if (process.platform === "darwin") return "macos";
+  return "linux";
+}
+
+function buildKiroEnvState(): { operatingSystem: string; currentWorkingDirectory: string } {
+  return {
+    operatingSystem: getKiroOperatingSystem(),
+    currentWorkingDirectory: process.cwd(),
+  };
+}
+
+function isKiroTranslatorCompressionEnabled(): boolean {
+  return process.env.KIRO_TRANSLATOR_ENABLE_COMPRESSION === "1";
+}
 
 type KiroEconomyProfileName = "safe" | "balanced" | "aggressive";
 
@@ -159,14 +177,16 @@ function truncateKiroSummary(value: string, maxChars: number): string {
 
 function getKiroHistoryText(item: unknown): { role: "user" | "assistant"; content: string } | null {
   if (!item || typeof item !== "object") return null;
-  const record = item as Record<string, any>;
+  const record = item as Record<string, unknown>;
   if (record.userInputMessage && typeof record.userInputMessage === "object") {
-    return { role: "user", content: stringifyKiroContent(record.userInputMessage.content) };
+    const userRecord = record.userInputMessage as { content?: unknown };
+    return { role: "user", content: stringifyKiroContent(userRecord.content) };
   }
   if (record.assistantResponseMessage && typeof record.assistantResponseMessage === "object") {
+    const assistantRecord = record.assistantResponseMessage as { content?: unknown };
     return {
       role: "assistant",
-      content: stringifyKiroContent(record.assistantResponseMessage.content),
+      content: stringifyKiroContent(assistantRecord.content),
     };
   }
   return null;
@@ -216,7 +236,7 @@ function compactKiroHistoryForSavings(
     userInputMessage: {
       content: buildKiroHistorySummary(oldHistory, economyProfile),
       modelId: "",
-      origin: "AI_EDITOR",
+      origin: KIRO_USER_ORIGIN,
     },
   };
 
@@ -316,41 +336,6 @@ function normalizeKiroToolSchema(schema: unknown): Record<string, unknown> {
   return result;
 }
 
-function serializeToolResultContent(content: unknown): string {
-  if (typeof content === "string") {
-    return content || "(no output)";
-  }
-  if (!Array.isArray(content)) {
-    if (content !== null && content !== undefined) {
-      try {
-        return JSON.stringify(content);
-      } catch {
-        return "(no output)";
-      }
-    }
-    return "(no output)";
-  }
-  const parts: string[] = [];
-  for (const block of content as Array<Record<string, unknown>>) {
-    if (!block || typeof block !== "object") continue;
-    if (block.type === "text" && typeof block.text === "string") {
-      if (block.text) parts.push(block.text);
-    } else if (block.type === "image" || block.type === "image_url") {
-      const src = block.source as Record<string, unknown> | undefined;
-      const mediaType = src?.media_type ?? block.media_type ?? "image";
-      parts.push(`[image: ${mediaType}]`);
-    } else {
-      try {
-        const str = JSON.stringify(block);
-        if (str && str !== "{}") parts.push(str);
-      } catch {
-        // skip unserializable block
-      }
-    }
-  }
-  return parts.join("\n") || "(no output)";
-}
-
 type KiroToolFunction = {
   name?: string;
   description?: string;
@@ -365,22 +350,28 @@ type KiroToolDefinition = {
   function?: KiroToolFunction;
 };
 
-function buildKiroToolSpecification(
-  tool: KiroToolDefinition,
-  descriptionOverride?: string
-): Record<string, unknown> {
-  const name = tool.function?.name || tool.name || "tool";
-  const description =
-    descriptionOverride || tool.function?.description || tool.description || `Tool: ${name}`;
+function buildKiroToolSpecification(tool: any) {
+  // Extract function data whether it comes from OpenAI format (tool.function) or Anthropic format
+  const toolData = tool.type === "function" && tool.function ? tool.function : tool;
+
+  // Handle both Anthropic's input_schema and OpenAI's parameters
+  const rawSchema = toolData.parameters ||
+    toolData.input_schema || { type: "object", properties: {} };
 
   return {
     toolSpecification: {
-      name,
-      description,
+      name: toolData.name,
+      description: toolData.description || "",
       inputSchema: {
-        json: normalizeKiroToolSchema(
-          tool.function?.parameters || tool.parameters || tool.input_schema || {}
-        ),
+        json: {
+          type: rawSchema.type || "object",
+          properties: rawSchema.properties || {},
+          ...(rawSchema.required &&
+          Array.isArray(rawSchema.required) &&
+          rawSchema.required.length > 0
+            ? { required: rawSchema.required }
+            : {}),
+        },
       },
     },
   };
@@ -464,7 +455,7 @@ function convertMessages(messages, tools, model, economyProfile: KiroEconomyProf
         userInputMessage: {
           content: content,
           modelId: "",
-          origin: "AI_EDITOR",
+          origin: KIRO_USER_ORIGIN,
         },
       };
 
@@ -539,8 +530,9 @@ function convertMessages(messages, tools, model, economyProfile: KiroEconomyProf
     const msg = messages[i];
     let role = msg.role;
 
-    // Normalize: system/tool -> user
-    if (role === "system" || role === "tool") {
+    // Normalize provider-specific instruction/tool turns into Kiro user turns.
+    // Kiro does not have a separate developer/system lane like Claude does.
+    if (role === "system" || role === "developer" || role === "tool") {
       role = "user";
     }
 
@@ -585,7 +577,7 @@ function convertMessages(messages, tools, model, economyProfile: KiroEconomyProf
           toolResultBlocks.forEach((block) => {
             const isError = Boolean(block.is_error);
             const text = truncateKiroToolResult(
-              serializeToolResultContent(block.content),
+              stringifyKiroContent(block.content),
               isError ? economyProfile.errorToolResultMaxChars : economyProfile.toolResultMaxChars,
               isError
             );
@@ -601,10 +593,8 @@ function convertMessages(messages, tools, model, economyProfile: KiroEconomyProf
 
       // Handle tool role (from normalized)
       if (msg.role === "tool") {
-        // Reuse the shared serializer so non-string content (arrays, structured/JSON
-        // blocks, images) is never collapsed to an empty string, then cap size for Kiro.
         const toolContent = truncateKiroToolResult(
-          serializeToolResultContent(msg.content),
+          stringifyKiroContent(msg.content),
           economyProfile.toolResultMaxChars,
           false
         );
@@ -658,20 +648,16 @@ function convertMessages(messages, tools, model, economyProfile: KiroEconomyProf
 
         const lastMsg = history[history.length - 1];
         if (lastMsg?.assistantResponseMessage) {
-          const NAMESPACE_KIRO_TOOLUSE = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
-          lastMsg.assistantResponseMessage.toolUses = toolUses.map((tc, idx) => {
+          lastMsg.assistantResponseMessage.toolUses = toolUses.map((tc) => {
             if (tc.function) {
-              const stableId =
-                tc.id || uuidv5(`${tc.function.name}:${idx}`, NAMESPACE_KIRO_TOOLUSE);
               return {
-                toolUseId: stableId,
+                toolUseId: tc.id || uuidv4(),
                 name: tc.function.name || "unknown_tool",
                 input: parseToolInput(tc.function.arguments),
               };
             } else {
-              const stableId = tc.id || uuidv5(`${tc.name}:${idx}`, NAMESPACE_KIRO_TOOLUSE);
               return {
-                toolUseId: stableId,
+                toolUseId: tc.id || uuidv4(),
                 name: tc.name || "unknown_tool",
                 input: parseToolInput(tc.input),
               };
@@ -700,7 +686,7 @@ function convertMessages(messages, tools, model, economyProfile: KiroEconomyProf
       userInputMessage: {
         content: "Continue",
         modelId: model,
-        origin: "AI_EDITOR",
+        origin: KIRO_USER_ORIGIN,
       },
     };
   }
@@ -763,7 +749,7 @@ function convertMessages(messages, tools, model, economyProfile: KiroEconomyProf
 
     // Kiro API requires `origin` on every userInputMessage
     if (item.userInputMessage && !item.userInputMessage.origin) {
-      item.userInputMessage.origin = "AI_EDITOR";
+      item.userInputMessage.origin = KIRO_USER_ORIGIN;
     }
   });
 
@@ -832,7 +818,7 @@ function convertMessages(messages, tools, model, economyProfile: KiroEconomyProf
       userInputMessage: {
         content: "(empty)",
         modelId: model,
-        origin: "AI_EDITOR",
+        origin: KIRO_USER_ORIGIN,
       },
     };
     // Mark as synthetic (non-enumerable so it doesn't leak to upstream JSON)
@@ -939,7 +925,13 @@ function convertMessages(messages, tools, model, economyProfile: KiroEconomyProf
 /**
  * Build Kiro payload from OpenAI format
  */
-export function buildKiroPayload(model, body, stream, credentials) {
+export function buildKiroPayload(
+  model,
+  body,
+  stream,
+  credentials,
+  options?: { enableCompression?: boolean }
+) {
   // Normalize model name: Claude Code sends dashes (claude-sonnet-4-6),
   // Kiro API expects dots (claude-sonnet-4.6). Convert trailing version segment.
   const normalizedModel = model.replace(
@@ -970,6 +962,8 @@ export function buildKiroPayload(model, body, stream, credentials) {
   const kiroContextReserveTokens = economyProfile.reserveTokens;
   const temperature = body.temperature;
   const topP = body.top_p;
+  const enableTranslatorCompression =
+    options?.enableCompression ?? isKiroTranslatorCompressionEnabled();
 
   // Kiro rejects history that references toolUses/toolResults without a tools
   // schema in userInputMessageContext. When callers omit body.tools but the
@@ -1022,66 +1016,77 @@ export function buildKiroPayload(model, body, stream, credentials) {
   } = convertMessages(messages, tools, normalizedModel, economyProfile);
   const history = compactKiroHistoryForSavings(rawHistory, economyProfile);
 
-  const profileArn = credentials?.providerSpecificData?.profileArn || "";
-
   let finalContent = currentMessage?.userInputMessage?.content || "";
   let kiroCompressionStats: { original: number; final: number } | null = null;
-  const timestamp = new Date().toISOString();
-  // Apply compression to the assembled history + currentMessage where possible
-  try {
-    const compressBody = {
-      messages: [
-        // Map merged history to simple messages for compression
-        ...(history || []).map((item: any) =>
-          item.userInputMessage
-            ? { role: "user", content: item.userInputMessage.content }
-            : item.assistantResponseMessage
-              ? { role: "assistant", content: item.assistantResponseMessage.content }
-              : { role: "user", content: "" }
-        ),
-        // currentMessage (make sure it's last)
-        currentMessage?.userInputMessage
-          ? { role: "user", content: currentMessage.userInputMessage.content }
-          : { role: "user", content: "" },
-      ],
-    };
-    const compressed = compressContext(compressBody, {
-      provider: "kiro",
-      model: normalizedModel,
-      maxTokens: kiroContextMaxTokens,
-      reserveTokens: Math.min(kiroContextReserveTokens, Math.max(0, kiroContextMaxTokens - 1)),
-    });
-    if (compressed && compressed.compressed && Array.isArray(compressed.body.messages)) {
-      kiroCompressionStats = compressionStatsFromContext(compressed.stats);
-      const msgs = compressed.body.messages as Array<Record<string, unknown>>;
-      const compressedHistory = msgs.slice(0, -1);
-      const preserveHistoryFrom = Math.max(0, history.length - economyProfile.preserveTailTurns);
-      for (let i = 0; i < compressedHistory.length && i < history.length; i++) {
-        if (i >= preserveHistoryFrom) continue;
-        const source = compressedHistory[i];
-        const target = history[i] as Record<string, unknown>;
-        if (typeof source.content !== "string") continue;
-        if (target.userInputMessage && typeof target.userInputMessage === "object") {
-          (target.userInputMessage as Record<string, unknown>).content = source.content;
-        } else if (
-          target.assistantResponseMessage &&
-          typeof target.assistantResponseMessage === "object"
-        ) {
-          (target.assistantResponseMessage as Record<string, unknown>).content = source.content;
+  if (enableTranslatorCompression) {
+    const timestamp = new Date().toISOString();
+    // Apply compression to the assembled history + currentMessage where possible.
+    try {
+      const compressBody = {
+        messages: [
+          // Map merged history to simple messages for compression
+          ...(history || []).map((item: unknown) => {
+            const record = item as {
+              userInputMessage?: { content?: string };
+              assistantResponseMessage?: { content?: string };
+            };
+            return record.userInputMessage
+              ? { role: "user", content: record.userInputMessage.content }
+              : record.assistantResponseMessage
+                ? { role: "assistant", content: record.assistantResponseMessage.content }
+                : { role: "user", content: "" };
+          }),
+          // currentMessage (make sure it's last)
+          currentMessage?.userInputMessage
+            ? { role: "user", content: currentMessage.userInputMessage.content }
+            : { role: "user", content: "" },
+        ],
+      };
+      const compressed = compressContext(compressBody, {
+        provider: "kiro",
+        model: normalizedModel,
+        maxTokens: kiroContextMaxTokens,
+        reserveTokens: Math.min(kiroContextReserveTokens, Math.max(0, kiroContextMaxTokens - 1)),
+      });
+      if (compressed && compressed.compressed && Array.isArray(compressed.body.messages)) {
+        kiroCompressionStats = compressionStatsFromContext(compressed.stats);
+        const msgs = compressed.body.messages as Array<Record<string, unknown>>;
+        const compressedHistory = msgs.slice(0, -1);
+        const preserveHistoryFrom = Math.max(0, history.length - economyProfile.preserveTailTurns);
+        for (let i = 0; i < compressedHistory.length && i < history.length; i++) {
+          if (i >= preserveHistoryFrom) continue;
+          const source = compressedHistory[i];
+          const target = history[i] as Record<string, unknown>;
+          if (typeof source.content !== "string") continue;
+          if (target.userInputMessage && typeof target.userInputMessage === "object") {
+            (target.userInputMessage as Record<string, unknown>).content = source.content;
+          } else if (
+            target.assistantResponseMessage &&
+            typeof target.assistantResponseMessage === "object"
+          ) {
+            (target.assistantResponseMessage as Record<string, unknown>).content = source.content;
+          }
+        }
+
+        // Use the last user message as final content after compression.
+        const lastUser = [...msgs].reverse().find((m) => m.role === "user");
+        if (lastUser && typeof lastUser.content === "string") {
+          finalContent = lastUser.content;
         }
       }
-
-      // Use the last user message as final content after compression
-      const lastUser = [...msgs].reverse().find((m) => m.role === "user");
-      if (lastUser && typeof lastUser.content === "string") {
-        finalContent = lastUser.content;
-      }
+    } catch (_err) {
+      // Compression is best-effort; fall back to uncompressed content.
     }
-  } catch (_err) {
-    // Compression is best-effort; fall back to uncompressed content
+    finalContent = `[Context: Current time is ${timestamp}]\n\n${finalContent}`;
   }
 
-  finalContent = `[Context: Current time is ${timestamp}]\n\n${finalContent}`;
+  if (currentMessage?.userInputMessage) {
+    const context = currentMessage.userInputMessage.userInputMessageContext || {};
+    if (!("envState" in context)) {
+      context.envState = buildKiroEnvState();
+    }
+    currentMessage.userInputMessage.userInputMessageContext = context;
+  }
 
   // Prepend tool documentation for tools with long descriptions (moved from toolSpecification)
   const toolDocs = (currentMessage as { _toolDocs?: string } | null)?._toolDocs;
@@ -1089,65 +1094,93 @@ export function buildKiroPayload(model, body, stream, credentials) {
     finalContent = `# Tool Documentation\n\n${toolDocs}\n\n---\n\n${finalContent}`;
   }
 
-  const payload: {
-    conversationState: {
-      chatTriggerType: string;
-      conversationId: string;
-      currentMessage: {
-        userInputMessage: {
-          content: string;
-          modelId: string;
-          origin: string;
-          images?: Array<{ format: string; source: { bytes: string } }>;
-          userInputMessageContext?: Record<string, unknown>;
-        };
-      };
-      history: unknown[];
-    };
-    profileArn?: string;
-    inferenceConfig?: {
-      maxTokens?: number;
-      temperature?: number;
-      topP?: number;
-    };
-    _omnirouteCompressionStats?: {
-      provider: "kiro";
-      originalTokens: number;
-      compressedTokens: number;
-      tokensCompressed: number;
-    };
-  } = {
-    conversationState: {
-      chatTriggerType: "MANUAL",
-      conversationId: uuidv4(), // We must override this with deterministic ID
-      currentMessage: {
-        userInputMessage: {
-          content: finalContent,
-          modelId: normalizedModel,
-          origin: "AI_EDITOR",
-          ...(currentMessage?.userInputMessage?.images?.length && {
-            images: currentMessage.userInputMessage.images,
-          }),
-          ...(currentMessage?.userInputMessage?.userInputMessageContext && {
-            userInputMessageContext: currentMessage.userInputMessage.userInputMessageContext,
-          }),
-        },
-      },
-      history: history,
-    },
-  };
+  // Build strictly-typed KiroAmazonQPayload
+  // Sanitize history: only keep userInputMessage.content(+origin) and assistantResponseMessage.content
+  // Ensure truncated tool docs are attached early so sanitized mapping can include them
+  try {
+    const toolDescriptionMax = economyProfile.toolDocMaxChars;
+    const toolDocsForHistory: string[] = [];
+    for (const t of (tools || []) as KiroToolDefinition[]) {
+      const name = t.function?.name || t.name || "tool";
+      const description = t.function?.description || t.description || "";
+      if (description && description.length > toolDescriptionMax) {
+        toolDocsForHistory.push(
+          `## Tool: ${name}\n\n${truncateKiroText(description, toolDescriptionMax, "tool docs truncated")}`
+        );
+      }
+    }
+    if (toolDocsForHistory.length > 0) {
+      const firstUser = history.find((h) => h?.userInputMessage);
+      if (firstUser && firstUser.userInputMessage) {
+        (firstUser.userInputMessage as any)._toolDocs = toolDocsForHistory.join("\n\n---\n\n");
+      }
+    }
+  } catch (_err) {
+    // best-effort only
+  }
+  const sanitizedHistory: Array<Record<string, unknown>> = (history || [])
+    .map((item) => {
+      if (item.userInputMessage) {
+        const ui = item.userInputMessage as Record<string, unknown>;
+        const content =
+          typeof ui.content === "string" ? ui.content : stringifyKiroContent(ui.content);
+        // If long tool docs were attached to this user message, preserve them in the
+        // history content so tests and upstream reviewers can see truncated markers.
+        const out: Record<string, unknown> = { userInputMessage: { content } };
+        const toolDocs = (ui as any)._toolDocs;
+        if (typeof toolDocs === "string" && toolDocs.length > 0) {
+          out.userInputMessage.content = `${out.userInputMessage.content}\n\n${toolDocs}`;
+        }
+        // preserve modelId for compatibility with existing consumers/tests
+        if (ui.modelId) out.userInputMessage.modelId = ui.modelId;
+        if (ui.origin) out.userInputMessage.origin = ui.origin;
+        // preserve toolResults if present on the user turn
+        if (
+          ui.userInputMessageContext &&
+          (ui.userInputMessageContext as Record<string, unknown>).toolResults
+        ) {
+          out.userInputMessage.userInputMessageContext = {
+            toolResults: (ui.userInputMessageContext as Record<string, unknown>).toolResults,
+          };
+        }
+        return out;
+      }
+      if (item.assistantResponseMessage) {
+        const ar = item.assistantResponseMessage as Record<string, unknown>;
+        const content =
+          typeof ar.content === "string" ? ar.content : stringifyKiroContent(ar.content);
+        const res: Record<string, unknown> = { assistantResponseMessage: { content } };
+        if (ar.toolUses) res.assistantResponseMessage.toolUses = ar.toolUses;
+        return res;
+      }
+      return {};
+    })
+    .filter((i) => Object.keys(i).length > 0);
 
-  // Deterministic session caching for Kiro.
-  // Skip synthetic placeholder turns ("(empty)" injected for assistant-first
-  // conversations or alternating-role gaps) — otherwise unrelated assistant-
-  // first chats would all hash to the same uuidv5(empty) and reuse the same
-  // upstream Kiro/AWS conversation context, leaking prior state across
-  // sessions. See conversionMessages() above for the `__synthetic` marker.
+  // Sanitize currentMessage: only content + userInputMessageContext (envState + tools)
+  const sanitizedCurrentUserContent = finalContent;
+
+  // Build tools specification array (deeply nested under userInputMessageContext.tools)
+  const incomingTools = Array.isArray(body.tools) && body.tools.length ? body.tools : tools || [];
+  const toolsSpecArray = incomingTools.map((t: KiroToolDefinition) =>
+    buildKiroToolSpecification(t)
+  );
+
+  // Start with any existing currentMessage context (preserves toolResults)
+  const existingCurrentContext =
+    currentMessage?.userInputMessage?.userInputMessageContext || ({} as Record<string, unknown>);
+  const userInputMessageContext: Record<string, unknown> = { ...existingCurrentContext };
+  // Ensure envState exists
+  if (!userInputMessageContext.envState) {
+    userInputMessageContext.envState = buildKiroEnvState();
+  }
+  // Attach tools spec to current context (deeply nested under userInputMessageContext.tools)
+  if (Array.isArray(toolsSpecArray) && toolsSpecArray.length > 0) {
+    userInputMessageContext.tools = toolsSpecArray;
+  }
+
+  // Deterministic session id (same logic as before)
   const NAMESPACE_KIRO = "34f7193f-561d-4050-bc84-9547d953d6bf";
-
-  // Priority 1: Extract first user message from pre-compression body (passed by chatCore before
-  // compressContext runs). This keeps conversationId stable even when compression alters content.
-  // Priority 2: Deterministic hash from first user message in translated history (fallback).
   const preCompressionBody = credentials?._preCompressionBody as
     | Record<string, unknown>
     | null
@@ -1168,44 +1201,54 @@ export function buildKiroPayload(model, body, stream, credentials) {
             .join(" ")
         : ""
     : "";
-  const firstRealUserTurn = history.find((h) => h?.userInputMessage?.content && !h.__synthetic);
-  const firstContent =
-    seedFromPreCompression || firstRealUserTurn?.userInputMessage?.content || finalContent;
-
-  // Use uuidv5 with the hash of the system prompt / first message to maintain AWS Builder ID context cache
-  payload.conversationState.conversationId = uuidv5(
-    (firstContent || "").substring(0, 4000),
-    NAMESPACE_KIRO
+  const firstRealUserTurn = sanitizedHistory.find((h) =>
+    Boolean((h as any).userInputMessage?.content)
   );
+  const firstContent =
+    seedFromPreCompression ||
+    (firstRealUserTurn as any)?.userInputMessage?.content ||
+    sanitizedCurrentUserContent;
+  const conversationId = uuidv5((firstContent || "").substring(0, 4000), NAMESPACE_KIRO);
 
-  if (profileArn) {
-    payload.profileArn = profileArn;
+  const conversationState: Record<string, unknown> = {
+    conversationId,
+    history: sanitizedHistory,
+    currentMessage: {
+      userInputMessage: {
+        content: sanitizedCurrentUserContent,
+        modelId: normalizedModel,
+        origin: KIRO_USER_ORIGIN,
+        userInputMessageContext: userInputMessageContext,
+      },
+    },
+    chatTriggerType: "MANUAL",
+  };
+
+  // agentTaskType may be carried in body (optional) — preserve if present
+  if (body.agentTaskType) {
+    conversationState.agentTaskType = body.agentTaskType;
   }
 
-  const compressionStats = kiroCompressionStats;
-  if (compressionStats) {
-    payload._omnirouteCompressionStats = {
+  const finalPayload: Record<string, unknown> = { conversationState };
+  // Preserve optional profileArn at root if provided by caller
+  if (typeof body.profileArn === "string" && body.profileArn.trim()) {
+    finalPayload.profileArn = body.profileArn;
+  }
+
+  // Re-expose compression stats for logging/consumption by consumeKiroCompressionStats
+  if (kiroCompressionStats) {
+    finalPayload._omnirouteCompressionStats = {
       provider: "kiro",
-      originalTokens: compressionStats.original,
-      compressedTokens: compressionStats.final,
-      tokensCompressed: compressionStats.original - compressionStats.final,
+      originalTokens: kiroCompressionStats.original,
+      compressedTokens: kiroCompressionStats.final,
+      tokensCompressed: kiroCompressionStats.original - kiroCompressionStats.final,
     };
   }
 
-  if (maxTokens || temperature !== undefined || topP !== undefined) {
-    payload.inferenceConfig = {};
-    if (maxTokens)
-      payload.inferenceConfig.maxTokens = Math.min(
-        maxTokens as number,
-        economyProfile.maxOutputTokens
-      );
-    if (temperature !== undefined) payload.inferenceConfig.temperature = temperature;
-    if (topP !== undefined) payload.inferenceConfig.topP = topP;
-  }
+  // Strip unsupported top-level fields (still no-op here but kept for safety)
+  stripUnsupportedKiroTopLevelFields(finalPayload as Record<string, unknown>);
 
-  stripUnsupportedKiroTopLevelFields(payload as Record<string, unknown>);
-
-  return payload;
+  return finalPayload as unknown;
 }
 
 register(FORMATS.OPENAI, FORMATS.KIRO, buildKiroPayload);

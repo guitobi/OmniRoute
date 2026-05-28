@@ -83,6 +83,10 @@ import {
   type CodexGlobalServiceMode,
 } from "@/lib/providers/codexFastTier";
 import { isClaudeExtraUsageBlockEnabled } from "@/lib/providers/claudeExtraUsage";
+import {
+  FREEBUFF_DEFAULT_LISTEN_PORT,
+  FREEBUFF_DEFAULT_OVERRIDE_TIER,
+} from "@/lib/providers/freebuff";
 import { parseExtraApiKeys } from "@/shared/utils/parseApiKeys";
 import RiskNoticeModal from "../components/RiskNoticeModal";
 import { isRiskAcknowledged, useRiskAcknowledged } from "../hooks/useRiskAcknowledged";
@@ -7498,6 +7502,7 @@ function AddApiKeyModal({
   const isGlm = isGlmProvider(provider);
   const isQoder = provider === "qoder";
   const isCloudflare = provider === "cloudflare-ai";
+  const isFreebuff = provider === "freebuff";
   const localProviderMetadata = getLocalProviderMetadata(provider);
   const isLocalSelfHostedProvider = !!localProviderMetadata;
   const isGooglePse = provider === "google-pse-search";
@@ -7534,6 +7539,8 @@ function AddApiKeyModal({
     customUserAgent: "",
     accountId: "",
     consoleApiKey: "",
+    listenPort: FREEBUFF_DEFAULT_LISTEN_PORT,
+    overrideTier: FREEBUFF_DEFAULT_OVERRIDE_TIER,
     ccCompatibleContext1m: false,
     passthroughModels: false,
   });
@@ -7634,7 +7641,7 @@ function AddApiKeyModal({
     const credentialInput = isCommandCode
       ? extractCommandCodeCredentialInput(formData.apiKey)
       : formData.apiKey;
-    if (!provider || (!isCompatible && !apiKeyOptional && !credentialInput)) return;
+    if (!provider || (!isFreebuff && !isCompatible && !apiKeyOptional && !credentialInput)) return;
 
     setSaving(true);
     setSaveError(null);
@@ -7654,7 +7661,7 @@ function AddApiKeyModal({
         validatedBaseUrl = checked.value;
       }
 
-      let isValid = Boolean(isNoAuthWebSessionCredential && !credentialInput);
+      let isValid = Boolean(isFreebuff || (isNoAuthWebSessionCredential && !credentialInput));
       let validationError: string | null = null;
       if (!isValid) {
         try {
@@ -7714,6 +7721,11 @@ function AddApiKeyModal({
       }
       if (isGooglePse && formData.cx.trim()) {
         providerSpecificData.cx = formData.cx.trim();
+      }
+      if (isFreebuff) {
+        providerSpecificData.listenPort = formData.listenPort || FREEBUFF_DEFAULT_LISTEN_PORT;
+        providerSpecificData.overrideTier =
+          formData.overrideTier.trim() || FREEBUFF_DEFAULT_OVERRIDE_TIER;
       }
       if (usesBaseUrl) {
         providerSpecificData.baseUrl = validatedBaseUrl;
@@ -8021,7 +8033,31 @@ function AddApiKeyModal({
                 t={t}
               />
             )}
-            {!isNoAuthWebSessionCredential && (
+            {isFreebuff && (
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Input
+                  label="Listen port"
+                  type="number"
+                  value={formData.listenPort}
+                  onChange={(e) =>
+                    setFormData({
+                      ...formData,
+                      listenPort:
+                        Number.parseInt(e.target.value, 10) || FREEBUFF_DEFAULT_LISTEN_PORT,
+                    })
+                  }
+                  hint="Port OmniRoute uses for Freebuff CLI interception."
+                />
+                <Input
+                  label="Override tier"
+                  value={formData.overrideTier}
+                  onChange={(e) => setFormData({ ...formData, overrideTier: e.target.value })}
+                  placeholder={FREEBUFF_DEFAULT_OVERRIDE_TIER}
+                  hint="Mock access tier returned by the session endpoint."
+                />
+              </div>
+            )}
+            {!isNoAuthWebSessionCredential && !isFreebuff && (
               <div className="flex gap-2">
                 <Input
                   label={apiCredentialLabel}
@@ -9743,6 +9779,8 @@ function EditConnectionModal({ isOpen, connection, onSave, onClose }: EditConnec
     codexServiceTier: "default" as CodexServiceTier,
     codexOpenaiStoreEnabled: false,
     consoleApiKey: "",
+    listenPort: FREEBUFF_DEFAULT_LISTEN_PORT,
+    overrideTier: FREEBUFF_DEFAULT_OVERRIDE_TIER,
     ccCompatibleContext1m: false,
     cloudCodeProjectId: "",
     antigravityClientProfile: "ide",
@@ -9787,6 +9825,7 @@ function EditConnectionModal({ isOpen, connection, onSave, onClose }: EditConnec
   const isClaude = connection?.provider === "claude";
   const isGeminiCli = connection?.provider === "gemini-cli";
   const isAntigravity = connection?.provider === "antigravity";
+  const isFreebuff = connection?.provider === "freebuff";
   const supportsGoogleProjectId = isGeminiCli || isAntigravity;
   const localProviderMetadata = getLocalProviderMetadata(connection?.provider);
   const isLocalSelfHostedProvider = !!localProviderMetadata;
@@ -9849,6 +9888,16 @@ function EditConnectionModal({ isOpen, connection, onSave, onClose }: EditConnec
       );
       const rawConsoleApiKey = connection.providerSpecificData?.consoleApiKey;
       const existingConsoleApiKey = typeof rawConsoleApiKey === "string" ? rawConsoleApiKey : "";
+      const rawListenPort = connection.providerSpecificData?.listenPort;
+      const existingListenPort =
+        typeof rawListenPort === "number" && Number.isInteger(rawListenPort)
+          ? rawListenPort
+          : FREEBUFF_DEFAULT_LISTEN_PORT;
+      const rawOverrideTier = connection.providerSpecificData?.overrideTier;
+      const existingOverrideTier =
+        typeof rawOverrideTier === "string" && rawOverrideTier.trim()
+          ? rawOverrideTier
+          : FREEBUFF_DEFAULT_OVERRIDE_TIER;
       setFormData({
         name: connection.name || "",
         priority: connection.priority || 1,
@@ -9875,6 +9924,8 @@ function EditConnectionModal({ isOpen, connection, onSave, onClose }: EditConnec
         codexServiceTier: codexRequestDefaults.serviceTier ?? "default",
         codexOpenaiStoreEnabled: connection.providerSpecificData?.openaiStoreEnabled === true,
         consoleApiKey: existingConsoleApiKey,
+        listenPort: existingListenPort,
+        overrideTier: existingOverrideTier,
         ccCompatibleContext1m: ccRequestDefaults.context1m,
         cloudCodeProjectId:
           (connection.providerSpecificData?.projectId as string) || connection.projectId || "",
@@ -10091,6 +10142,12 @@ function EditConnectionModal({ isOpen, connection, onSave, onClose }: EditConnec
         }
         if (isGooglePse) {
           updates.providerSpecificData.cx = formData.cx.trim() || undefined;
+        }
+        if (isFreebuff) {
+          updates.providerSpecificData.listenPort =
+            formData.listenPort || FREEBUFF_DEFAULT_LISTEN_PORT;
+          updates.providerSpecificData.overrideTier =
+            formData.overrideTier.trim() || FREEBUFF_DEFAULT_OVERRIDE_TIER;
         }
         if (usesBaseUrl) {
           updates.providerSpecificData.baseUrl = validatedBaseUrl;
@@ -10361,7 +10418,31 @@ function EditConnectionModal({ isOpen, connection, onSave, onClose }: EditConnec
                 t={t}
               />
             )}
-            {!isNoAuthWebSessionCredential && (
+            {isFreebuff && (
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Input
+                  label="Listen port"
+                  type="number"
+                  value={formData.listenPort}
+                  onChange={(e) =>
+                    setFormData({
+                      ...formData,
+                      listenPort:
+                        Number.parseInt(e.target.value, 10) || FREEBUFF_DEFAULT_LISTEN_PORT,
+                    })
+                  }
+                  hint="Port OmniRoute uses for Freebuff CLI interception."
+                />
+                <Input
+                  label="Override tier"
+                  value={formData.overrideTier}
+                  onChange={(e) => setFormData({ ...formData, overrideTier: e.target.value })}
+                  placeholder={FREEBUFF_DEFAULT_OVERRIDE_TIER}
+                  hint="Mock access tier returned by the session endpoint."
+                />
+              </div>
+            )}
+            {!isNoAuthWebSessionCredential && !isFreebuff && (
               <div className="flex gap-2">
                 <Input
                   label={apiCredentialLabel}

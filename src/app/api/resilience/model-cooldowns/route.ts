@@ -6,7 +6,6 @@ import {
   resetAllAvailability,
 } from "@/domain/modelAvailability";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
-import { isValidationFailure, validateBody, getValidationError } from "@/shared/validation/helpers";
 import { validateBody } from "@/shared/validation/helpers";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error";
 

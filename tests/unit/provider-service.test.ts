@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   buildProviderHeaders,
   buildProviderUrl,
+  detectFormat,
   getProviderConfig,
   getProviderFallbackCount,
   getTargetFormat,
@@ -41,6 +42,16 @@ test("OpenAI-compatible legacy providers honor providerSpecificData.apiType", ()
     getTargetFormat("openai-compatible-sp-openai", providerSpecificData),
     "openai-responses"
   );
+});
+
+test("detectFormat keeps slash-model Cloud Code bodies on the OpenAI path", () => {
+  const format = detectFormat({
+    model: "cc/claude-sonnet-4-5",
+    system: [{ type: "text", text: "system" }],
+    messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+  });
+
+  assert.equal(format, "openai");
 });
 
 test("Anthropic-compatible Claude Code providers use the Claude Code URL and headers", () => {
