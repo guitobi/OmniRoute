@@ -4,6 +4,7 @@
  */
 import { register } from "../registry.ts";
 import { FORMATS } from "../formats.ts";
+import { normalizeKiroToolUseForClaude } from "../kiroToolBridge.ts";
 
 /**
  * Parse Kiro SSE event and convert to OpenAI format
@@ -56,6 +57,7 @@ export function convertKiroToOpenAI(chunk, state) {
     state.responseId = `chatcmpl-${Date.now()}`;
     state.created = Math.floor(Date.now() / 1000);
     state.chunkIndex = 0;
+    state.toolCallIndex = 0;
   }
 
   const eventType = data._eventType || data.event || "";
@@ -117,8 +119,11 @@ export function convertKiroToOpenAI(chunk, state) {
   if (eventType === "toolUseEvent" || data.toolUseEvent) {
     const toolUse = data.toolUseEvent || data;
     const toolCallId = toolUse.toolUseId || `call_${Date.now()}`;
-    const toolName = toolUse.name || "";
-    const toolInput = toolUse.input || {};
+    const toolCalls = normalizeKiroToolUseForClaude(
+      toolCallId,
+      toolUse.name || "",
+      toolUse.input || {}
+    );
 
     const openaiChunk = {
       id: state.responseId,
@@ -130,17 +135,15 @@ export function convertKiroToOpenAI(chunk, state) {
           index: 0,
           delta: {
             ...(state.chunkIndex === 0 ? { role: "assistant" } : {}),
-            tool_calls: [
-              {
-                index: 0,
-                id: toolCallId,
-                type: "function",
-                function: {
-                  name: toolName,
-                  arguments: JSON.stringify(toolInput),
-                },
+            tool_calls: toolCalls.map((toolCall) => ({
+              index: state.toolCallIndex++,
+              id: toolCall.id,
+              type: "function",
+              function: {
+                name: toolCall.name,
+                arguments: JSON.stringify(toolCall.input || {}),
               },
-            ],
+            })),
           },
           finish_reason: null,
         },

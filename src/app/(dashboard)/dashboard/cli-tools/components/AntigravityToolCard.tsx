@@ -6,6 +6,17 @@ import { useTranslations } from "next-intl";
 
 import ProviderIcon from "@/shared/components/ProviderIcon";
 
+export function buildAntigravityMitmStartBody({ apiKeys, selectedApiKeyId, sudoPassword }) {
+  const selectedKeyId = selectedApiKeyId?.trim() || (apiKeys?.length > 0 ? apiKeys[0].id : null);
+  const selectedKey = selectedKeyId ? apiKeys?.find((key) => key.id === selectedKeyId) : null;
+
+  return {
+    apiKey: selectedKey?.rawKey || "sk_omniroute",
+    keyId: selectedKeyId,
+    sudoPassword,
+  };
+}
+
 export default function AntigravityToolCard({
   tool,
   isExpanded,
@@ -96,18 +107,16 @@ export default function AntigravityToolCard({
     setLoading(true);
     setMessage(null);
     try {
-      // (#523) Prefer keyId lookup so the backend writes the real key to disk.
-      const selectedKeyId =
-        selectedApiKeyId?.trim() || (apiKeys?.length > 0 ? apiKeys[0].id : null);
+      const postBody = buildAntigravityMitmStartBody({
+        apiKeys,
+        selectedApiKeyId,
+        sudoPassword: password,
+      });
 
       const res = await fetch("/api/cli-tools/antigravity-mitm", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          apiKey: !cloudEnabled ? "sk_omniroute" : null,
-          keyId: selectedKeyId,
-          sudoPassword: password,
-        }),
+        body: JSON.stringify(postBody),
       });
 
       const data = await res.json();

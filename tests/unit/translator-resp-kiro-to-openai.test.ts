@@ -35,22 +35,151 @@ test("Kiro -> OpenAI: reasoningContentEvent is wrapped as thinking tags", () => 
   assert.equal(result.choices[0].delta.content, "<thinking>Need to inspect first</thinking>");
 });
 
-test("Kiro -> OpenAI: toolUseEvent becomes OpenAI tool_calls", () => {
+test("Kiro -> OpenAI: native read toolUseEvent becomes Claude Code Read tool_call", () => {
   const result = convertKiroToOpenAI(
     {
       _eventType: "toolUseEvent",
       toolUseId: "call_1",
-      name: "read_file",
-      input: { path: "/tmp/a" },
+      name: "read",
+      input: { operations: [{ path: "/tmp/a", mode: "Line", offset: 2, limit: 10 }] },
     },
     {}
   );
 
   assert.equal(result.choices[0].delta.tool_calls[0].id, "call_1");
-  assert.equal(result.choices[0].delta.tool_calls[0].function.name, "read_file");
+  assert.equal(result.choices[0].delta.tool_calls[0].function.name, "Read");
   assert.equal(
     result.choices[0].delta.tool_calls[0].function.arguments,
-    JSON.stringify({ path: "/tmp/a" })
+    JSON.stringify({ file_path: "/tmp/a", offset: 2, limit: 10 })
+  );
+});
+
+test("Kiro -> OpenAI: native tool names are mapped back to Claude Code names", () => {
+  const cases = [
+    ["glob", "Glob"],
+    ["grep", "Grep"],
+    ["shell", "PowerShell"],
+    ["web_fetch", "WebFetch"],
+    ["web_search", "WebSearch"],
+    ["write", "Write"],
+  ];
+
+  for (const [kiroName, claudeName] of cases) {
+    const result = convertKiroToOpenAI(
+      { _eventType: "toolUseEvent", toolUseId: `call_${kiroName}`, name: kiroName, input: {} },
+      {}
+    );
+    assert.equal(result.choices[0].delta.tool_calls[0].function.name, claudeName);
+  }
+});
+
+test("Kiro -> OpenAI: Kiro-only tool arguments are stripped for Claude Code schemas", () => {
+  const shell = convertKiroToOpenAI(
+    {
+      _eventType: "toolUseEvent",
+      toolUseId: "call_shell",
+      name: "shell",
+      input: {
+        command: "Get-Location",
+        cwd: "D:\\tmp",
+        timeout_ms: 1000,
+        __tool_use_purpose: "Check cwd",
+      },
+    },
+    {}
+  );
+  assert.equal(shell.choices[0].delta.tool_calls[0].function.name, "PowerShell");
+  assert.equal(
+    shell.choices[0].delta.tool_calls[0].function.arguments,
+    JSON.stringify({ command: "Get-Location", timeout: 1000, description: "Check cwd" })
+  );
+
+  const directoryRead = convertKiroToOpenAI(
+    {
+      _eventType: "toolUseEvent",
+      toolUseId: "call_dir",
+      name: "read",
+      input: { operations: [{ path: "D:\\repo", mode: "Directory", depth: 2 }] },
+    },
+    {}
+  );
+  assert.equal(directoryRead.choices[0].delta.tool_calls[0].function.name, "Glob");
+  assert.equal(
+    directoryRead.choices[0].delta.tool_calls[0].function.arguments,
+    JSON.stringify({ pattern: "*", path: "D:\\repo" })
+  );
+});
+
+test("Kiro -> OpenAI: stringified Kiro read input is parsed before Claude mapping", () => {
+  const result = convertKiroToOpenAI(
+    {
+      _eventType: "toolUseEvent",
+      toolUseId: "call_read_string",
+      name: "read",
+      input: JSON.stringify({ operations: [{ path: "D:\\repo\\file.ts", mode: "Line" }] }),
+    },
+    {}
+  );
+
+  assert.equal(result.choices[0].delta.tool_calls[0].function.name, "Read");
+  assert.equal(
+    result.choices[0].delta.tool_calls[0].function.arguments,
+    JSON.stringify({ file_path: "D:\\repo\\file.ts" })
+  );
+});
+
+test("Kiro -> OpenAI: batch read toolUseEvent expands to multiple Claude Code tool_calls", () => {
+  const result = convertKiroToOpenAI(
+    {
+      _eventType: "toolUseEvent",
+      toolUseId: "call_batch",
+      name: "read",
+      input: {
+        operations: [
+          { path: "D:\\repo\\a.ts", mode: "Line", offset: 4, limit: 8 },
+          { path: "D:\\repo\\b.ts", mode: "Line" },
+          { path: "D:\\repo\\src", mode: "Directory" },
+        ],
+      },
+    },
+    {}
+  );
+
+  const toolCalls = result.choices[0].delta.tool_calls;
+  assert.deepEqual(
+    toolCalls.map((toolCall) => toolCall.id),
+    ["call_batch_0", "call_batch_1", "call_batch_2"]
+  );
+  assert.deepEqual(
+    toolCalls.map((toolCall) => toolCall.function.name),
+    ["Read", "Read", "Glob"]
+  );
+  assert.equal(
+    toolCalls[0].function.arguments,
+    JSON.stringify({ file_path: "D:\\repo\\a.ts", offset: 4, limit: 8 })
+  );
+  assert.equal(toolCalls[1].function.arguments, JSON.stringify({ file_path: "D:\\repo\\b.ts" }));
+  assert.equal(
+    toolCalls[2].function.arguments,
+    JSON.stringify({ pattern: "*", path: "D:\\repo\\src" })
+  );
+});
+
+test("Kiro -> OpenAI: Kiro code toolUseEvent maps to executable Claude Code tool_call", () => {
+  const result = convertKiroToOpenAI(
+    {
+      _eventType: "toolUseEvent",
+      toolUseId: "call_code",
+      name: "code",
+      input: { operation: "pattern_search", pattern: "buildKiroPayload", path: "open-sse" },
+    },
+    {}
+  );
+
+  assert.equal(result.choices[0].delta.tool_calls[0].function.name, "Grep");
+  assert.equal(
+    result.choices[0].delta.tool_calls[0].function.arguments,
+    JSON.stringify({ pattern: "buildKiroPayload", path: "open-sse" })
   );
 });
 

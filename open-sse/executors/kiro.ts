@@ -8,6 +8,7 @@ import {
 import { PROVIDERS } from "../config/constants.ts";
 import { v4 as uuidv4 } from "uuid";
 import { refreshKiroToken } from "../services/tokenRefresh.ts";
+import { normalizeKiroToolUseForClaude } from "../translator/kiroToolBridge.ts";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -31,6 +32,7 @@ type KiroStreamState = {
   hasContextUsage?: boolean;
   hasMeteringEvent?: boolean;
   usage?: UsageSummary;
+  estimatedInputTokens?: number;
 };
 
 type EventFrame = {
@@ -329,24 +331,20 @@ export function resetKiroExecutorProtectionForTest(): void {
 }
 
 function ensureKiroUsage(state: KiroStreamState) {
-  if (state.usage) return;
+  if (state.usage && state.usage.prompt_tokens > 0) return;
 
   const estimatedOutputTokens =
     state.totalContentLength && state.totalContentLength > 0
       ? Math.max(1, Math.floor(state.totalContentLength / 4))
       : 0;
 
-  const estimatedInputTokens =
-    state.contextUsagePercentage && state.contextUsagePercentage > 0
-      ? Math.floor((state.contextUsagePercentage * 200000) / 100)
-      : 0;
-
-  if (estimatedInputTokens <= 0 && estimatedOutputTokens <= 0) return;
+  const prompt_tokens = state.usage?.prompt_tokens || state.estimatedInputTokens || 0;
+  const completion_tokens = state.usage?.completion_tokens || estimatedOutputTokens;
 
   state.usage = {
-    prompt_tokens: estimatedInputTokens,
-    completion_tokens: estimatedOutputTokens,
-    total_tokens: estimatedInputTokens + estimatedOutputTokens,
+    prompt_tokens,
+    completion_tokens,
+    total_tokens: prompt_tokens + completion_tokens,
   };
 }
 
@@ -411,7 +409,9 @@ export class KiroExecutor extends BaseExecutor {
     if (b.conversationState !== undefined) kiroPayload.conversationState = b.conversationState;
     if (b.profileArn !== undefined) kiroPayload.profileArn = b.profileArn;
     if (b.inferenceConfig !== undefined) kiroPayload.inferenceConfig = b.inferenceConfig;
-    delete b._omnirouteCompressionStats;
+    if (b._omnirouteCompressionStats !== undefined) {
+      kiroPayload._omnirouteCompressionStats = b._omnirouteCompressionStats;
+    }
 
     // Fallback: if somehow conversationState isn't there, return the rest without model
     // (for backward compatibility if something else bypasses the translator)
@@ -511,7 +511,10 @@ export class KiroExecutor extends BaseExecutor {
         /* swallow logging errors */
       }
       const transformedBody = await this.transformRequest(model, body, stream, creds);
-      const serializedBody = JSON.stringify(transformedBody);
+      const bodyForAws = { ...(transformedBody as Record<string, unknown>) };
+      delete bodyForAws._omnirouteCompressionStats;
+      const serializedBody = JSON.stringify(bodyForAws);
+      const estimatedInputTokens = Math.ceil(serializedBody.length / 4);
       const dedupeKey = getKiroDedupeKey(model, transformedBody, getKiroAccountKey(creds));
       const dedupeTtlMs = readKiroDedupeTtlMs();
       pruneKiroDedupe();
@@ -525,7 +528,7 @@ export class KiroExecutor extends BaseExecutor {
           statusText: snapshot.statusText,
           headers: snapshot.headers,
         });
-        return { response, url, headers, transformedBody };
+        return { response, url, headers, transformedBody, estimatedInputTokens };
       }
 
       const responsePromise = fetch(url, {
@@ -569,7 +572,7 @@ export class KiroExecutor extends BaseExecutor {
         kiroInFlightResponses.delete(dedupeKey);
       }
 
-      return { response, url, headers, transformedBody };
+      return { response, url, headers, transformedBody, estimatedInputTokens };
     };
 
     // Retry loop: respect Retry-After and apply exponential backoff + jitter
@@ -580,10 +583,12 @@ export class KiroExecutor extends BaseExecutor {
     let url = "";
     let headers: Record<string, string> = {};
     let transformedBody: unknown = undefined;
+    let estimatedInputTokens = 0;
 
     while (attempt < maxAttempts) {
       attempt++;
-      ({ response, url, headers, transformedBody } = await doFetch(activeCredentials));
+      ({ response, url, headers, transformedBody, estimatedInputTokens } =
+        await doFetch(activeCredentials));
 
       // On auth failures — token expired/revoked, attempt refresh once before returning error.
       if (credentials?.refreshToken) {
@@ -598,7 +603,8 @@ export class KiroExecutor extends BaseExecutor {
             if (refreshed) {
               activeCredentials = { ...credentials, ...refreshed };
               await persistRefreshed(refreshed);
-              ({ response, url, headers, transformedBody } = await doFetch(activeCredentials));
+              ({ response, url, headers, transformedBody, estimatedInputTokens } =
+                await doFetch(activeCredentials));
             }
           } catch (err) {
             log?.warn?.("TOKEN", `Kiro refresh on auth failure failed: ${toError(err).message}`);
@@ -672,7 +678,12 @@ export class KiroExecutor extends BaseExecutor {
 
     // For Kiro, we need to transform the binary EventStream to SSE
     // Create a TransformStream to convert binary to SSE text
-    const transformedResponse = this.transformEventStreamToSSE(response, model, transformedBody);
+    const transformedResponse = this.transformEventStreamToSSE(
+      response,
+      model,
+      transformedBody,
+      estimatedInputTokens
+    );
 
     return { response: transformedResponse, url, headers, transformedBody };
   }
@@ -681,7 +692,12 @@ export class KiroExecutor extends BaseExecutor {
    * Transform AWS EventStream binary response to SSE text stream
    * Using TransformStream instead of ReadableStream.pull() to avoid Workers timeout
    */
-  transformEventStreamToSSE(response: Response, model: string, transformedBody?: unknown) {
+  transformEventStreamToSSE(
+    response: Response,
+    model: string,
+    transformedBody?: unknown,
+    estimatedInputTokens: number = 0
+  ) {
     const buffer = new ByteQueue();
     let chunkIndex = 0;
     const responseId = `chatcmpl-${Date.now()}`;
@@ -693,6 +709,24 @@ export class KiroExecutor extends BaseExecutor {
       hasToolCalls: false,
       toolCallIndex: 0,
       seenToolIds: new Map(),
+      estimatedInputTokens,
+    };
+
+    const emitFinishChunk = (
+      controller: TransformStreamDefaultController<Uint8Array>,
+      includeUsage: boolean
+    ) => {
+      if (state.finishEmitted) return;
+      state.finishEmitted = true;
+      if (includeUsage) ensureKiroUsage(state);
+      const finishChunk = buildKiroFinishChunk(state, responseId, created, model, includeUsage);
+      controller.enqueue(TEXT_ENCODER.encode(`data: ${JSON.stringify(finishChunk)}\n\n`));
+    };
+
+    const emitDone = (controller: TransformStreamDefaultController<Uint8Array>) => {
+      if (state.endDetected) return;
+      state.endDetected = true;
+      controller.enqueue(TEXT_ENCODER.encode("data: [DONE]\n\n"));
     };
 
     const transformStream = new TransformStream({
@@ -715,6 +749,7 @@ export class KiroExecutor extends BaseExecutor {
           if (!event) continue;
 
           const eventType = event.headers[":event-type"] || "";
+          if (state.endDetected) continue;
 
           // Track total content length for token estimation
           if (!state.totalContentLength) state.totalContentLength = 0;
@@ -771,84 +806,83 @@ export class KiroExecutor extends BaseExecutor {
             const toolUses = Array.isArray(toolUse) ? toolUse : [toolUse];
 
             for (const singleToolUse of toolUses) {
-              const toolCallId = singleToolUse.toolUseId || `call_${Date.now()}`;
-              const toolName = singleToolUse.name || "";
-              const toolInput = singleToolUse.input;
+              const baseToolCallId = singleToolUse.toolUseId || `call_${Date.now()}`;
+              const claudeToolCalls = normalizeKiroToolUseForClaude(
+                baseToolCallId,
+                typeof singleToolUse.name === "string" ? singleToolUse.name : "",
+                singleToolUse.input
+              );
 
-              let toolIndex;
-              const isNewTool = !state.seenToolIds.has(toolCallId);
+              for (const claudeToolCall of claudeToolCalls) {
+                const toolCallId = claudeToolCall.id;
+                const toolName = claudeToolCall.name;
+                const argumentsStr = JSON.stringify(claudeToolCall.input || {});
 
-              if (isNewTool) {
-                toolIndex = state.toolCallIndex++;
-                state.seenToolIds.set(toolCallId, toolIndex);
+                let toolIndex;
+                const isNewTool = !state.seenToolIds.has(toolCallId);
 
-                const startChunk = {
-                  id: responseId,
-                  object: "chat.completion.chunk",
-                  created,
-                  model,
-                  choices: [
-                    {
-                      index: 0,
-                      delta: {
-                        ...(chunkIndex === 0 ? { role: "assistant" } : {}),
-                        tool_calls: [
-                          {
-                            index: toolIndex,
-                            id: toolCallId,
-                            type: "function",
-                            function: {
-                              name: toolName,
-                              arguments: "",
+                if (isNewTool) {
+                  toolIndex = state.toolCallIndex++;
+                  state.seenToolIds.set(toolCallId, toolIndex);
+
+                  const startChunk = {
+                    id: responseId,
+                    object: "chat.completion.chunk",
+                    created,
+                    model,
+                    choices: [
+                      {
+                        index: 0,
+                        delta: {
+                          ...(chunkIndex === 0 ? { role: "assistant" } : {}),
+                          tool_calls: [
+                            {
+                              index: toolIndex,
+                              id: toolCallId,
+                              type: "function",
+                              function: {
+                                name: toolName,
+                                arguments: argumentsStr,
+                              },
                             },
-                          },
-                        ],
+                          ],
+                        },
+                        finish_reason: null,
                       },
-                      finish_reason: null,
-                    },
-                  ],
-                };
-                chunkIndex++;
-                controller.enqueue(TEXT_ENCODER.encode(`data: ${JSON.stringify(startChunk)}\n\n`));
-              } else {
-                toolIndex = state.seenToolIds.get(toolCallId);
-              }
-
-              if (toolInput !== undefined) {
-                let argumentsStr;
-
-                if (typeof toolInput === "string") {
-                  argumentsStr = toolInput;
-                } else if (typeof toolInput === "object") {
-                  argumentsStr = JSON.stringify(toolInput);
+                    ],
+                  };
+                  chunkIndex++;
+                  controller.enqueue(
+                    TEXT_ENCODER.encode(`data: ${JSON.stringify(startChunk)}\n\n`)
+                  );
                 } else {
-                  continue;
-                }
+                  toolIndex = state.seenToolIds.get(toolCallId);
 
-                const argsChunk = {
-                  id: responseId,
-                  object: "chat.completion.chunk",
-                  created,
-                  model,
-                  choices: [
-                    {
-                      index: 0,
-                      delta: {
-                        tool_calls: [
-                          {
-                            index: toolIndex,
-                            function: {
-                              arguments: argumentsStr,
+                  const argsChunk = {
+                    id: responseId,
+                    object: "chat.completion.chunk",
+                    created,
+                    model,
+                    choices: [
+                      {
+                        index: 0,
+                        delta: {
+                          tool_calls: [
+                            {
+                              index: toolIndex,
+                              function: {
+                                arguments: argumentsStr,
+                              },
                             },
-                          },
-                        ],
+                          ],
+                        },
+                        finish_reason: null,
                       },
-                      finish_reason: null,
-                    },
-                  ],
-                };
-                chunkIndex++;
-                controller.enqueue(TEXT_ENCODER.encode(`data: ${JSON.stringify(argsChunk)}\n\n`));
+                    ],
+                  };
+                  chunkIndex++;
+                  controller.enqueue(TEXT_ENCODER.encode(`data: ${JSON.stringify(argsChunk)}\n\n`));
+                }
               }
             }
           }
@@ -856,6 +890,15 @@ export class KiroExecutor extends BaseExecutor {
           // Handle messageStopEvent
           if (eventType === "messageStopEvent") {
             state.stopSeen = true;
+            // Claude Code does not execute tool calls until it receives the
+            // terminal tool_calls finish event. Kiro may keep the EventStream
+            // open for metrics after messageStopEvent, so emit the finish as
+            // soon as the assistant turn has stopped instead of waiting for
+            // stream close/flush.
+            if (state.hasToolCalls) {
+              emitFinishChunk(controller, false);
+              emitDone(controller);
+            }
           }
 
           // Handle contextUsageEvent to extract contextUsagePercentage
@@ -923,15 +966,10 @@ export class KiroExecutor extends BaseExecutor {
 
       async flush(controller) {
         // Emit finish chunk if not already sent
-        if (!state.finishEmitted) {
-          state.finishEmitted = true;
-          ensureKiroUsage(state);
-          const finishChunk = buildKiroFinishChunk(state, responseId, created, model, true);
-          controller.enqueue(TEXT_ENCODER.encode(`data: ${JSON.stringify(finishChunk)}\n\n`));
-        }
+        emitFinishChunk(controller, true);
 
         // Send final done message
-        controller.enqueue(TEXT_ENCODER.encode("data: [DONE]\n\n"));
+        emitDone(controller);
         // Best-effort: persist usage to DB for token accounting
         try {
           const { insertKiroUsageRow } = await import("../../src/lib/db/kiroUsage.ts");

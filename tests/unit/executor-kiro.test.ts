@@ -143,6 +143,26 @@ test("KiroExecutor.transformRequest removes the top-level model field", () => {
   );
 });
 
+test("KiroExecutor.transformRequest preserves compression stats for OmniRoute logging", () => {
+  const executor = new KiroExecutor();
+  const stats = { originalTokens: 100, compressedTokens: 60, tokensCompressed: 40 };
+  const body = {
+    model: "kiro-model",
+    _omnirouteCompressionStats: stats,
+    conversationState: {
+      currentMessage: {
+        userInputMessage: {
+          modelId: "kiro-model",
+        },
+      },
+    },
+  };
+
+  const result = executor.transformRequest("kiro-model", body, true, {}) as any;
+  assert.deepEqual(result._omnirouteCompressionStats, stats);
+  assert.deepEqual((body as any)._omnirouteCompressionStats, stats);
+});
+
 test("KiroExecutor.transformRequest strips unsupported fields in fallback mode", () => {
   const executor = new KiroExecutor();
   const body = {
@@ -181,8 +201,8 @@ test("KiroExecutor.transformEventStreamToSSE converts text, tool calls, usage an
     buildEventFrame("codeEvent", { content: "world" }),
     buildEventFrame("toolUseEvent", {
       toolUseId: "tool_1",
-      name: "read_file",
-      input: { path: "/tmp/a" },
+      name: "read",
+      input: { operations: [{ path: "/tmp/a", mode: "Line", offset: 3, limit: 9 }] },
     }),
     buildEventFrame("metricsEvent", { inputTokens: 4, outputTokens: 6 }),
     buildEventFrame("contextUsageEvent", { contextUsagePercentage: 10 }),
@@ -196,12 +216,188 @@ test("KiroExecutor.transformEventStreamToSSE converts text, tool calls, usage an
   assert.equal(transformed.headers.get("Content-Type"), "text/event-stream");
   assert.match(text, /"content":"Hello "/);
   assert.match(text, /"content":"world"/);
-  assert.match(text, /"name":"read_file"/);
-  assert.match(text, /"arguments":"\{\\"path\\":\\"\/tmp\/a\\"\}"/);
+  assert.match(text, /"name":"Read"/);
+  assert.match(
+    text,
+    /"arguments":"\{\\"file_path\\":\\"\/tmp\/a\\",\\"offset\\":3,\\"limit\\":9\}"/
+  );
+  assert.doesNotMatch(text, /"arguments":""/);
+  const toolChunks = parseSSEJsonChunks(text).filter(
+    (chunk) => chunk.choices?.[0]?.delta?.tool_calls
+  );
+  assert.equal(toolChunks.length, 1);
+  assert.deepEqual(toolChunks[0].choices[0].delta.tool_calls[0].function, {
+    name: "Read",
+    arguments: JSON.stringify({ file_path: "/tmp/a", offset: 3, limit: 9 }),
+  });
   assert.match(text, /"prompt_tokens":4/);
   assert.match(text, /"completion_tokens":6/);
   assert.match(text, /"finish_reason":"tool_calls"/);
   assert.match(text, /\[DONE\]/);
+});
+
+test("KiroExecutor.transformEventStreamToSSE strips Kiro-only tool arguments for Claude Code", async () => {
+  const executor = new KiroExecutor();
+  const response = buildEventStreamResponse([
+    buildEventFrame("toolUseEvent", {
+      toolUseId: "tool_shell",
+      name: "shell",
+      input: {
+        command: "Get-Location",
+        cwd: "D:\\tmp",
+        timeout_ms: 1000,
+        __tool_use_purpose: "Check location",
+      },
+    }),
+    buildEventFrame("toolUseEvent", {
+      toolUseId: "tool_grep",
+      name: "grep",
+      input: {
+        pattern: "TODO",
+        include: "*.ts",
+        max_depth: 3,
+        __tool_use_purpose: "Find TODOs",
+      },
+    }),
+  ]);
+
+  const transformed = executor.transformEventStreamToSSE(response, "kiro-model");
+  const text = await transformed.text();
+
+  assert.match(text, /"name":"PowerShell"/);
+  assert.match(
+    text,
+    /"arguments":"\{\\"command\\":\\"Get-Location\\",\\"timeout\\":1000,\\"description\\":\\"Check location\\"\}"/
+  );
+  assert.doesNotMatch(text, /cwd/);
+  assert.doesNotMatch(text, /timeout_ms/);
+  assert.match(text, /"name":"Grep"/);
+  assert.match(text, /"arguments":"\{\\"pattern\\":\\"TODO\\",\\"glob\\":\\"\*\.ts\\"\}"/);
+  assert.doesNotMatch(text, /max_depth/);
+  assert.doesNotMatch(text, /__tool_use_purpose/);
+});
+
+test("KiroExecutor.transformEventStreamToSSE parses stringified Kiro read input", async () => {
+  const executor = new KiroExecutor();
+  const response = buildEventStreamResponse([
+    buildEventFrame("toolUseEvent", {
+      toolUseId: "tool_read_string",
+      name: "read",
+      input: JSON.stringify({ operations: [{ path: "D:\\repo\\file.ts", mode: "Line" }] }),
+    }),
+  ]);
+
+  const transformed = executor.transformEventStreamToSSE(response, "kiro-model");
+  const text = await transformed.text();
+  const toolChunks = parseSSEJsonChunks(text).filter(
+    (chunk) => chunk.choices?.[0]?.delta?.tool_calls
+  );
+
+  assert.equal(toolChunks.length, 1);
+  assert.deepEqual(toolChunks[0].choices[0].delta.tool_calls[0].function, {
+    name: "Read",
+    arguments: JSON.stringify({ file_path: "D:\\repo\\file.ts" }),
+  });
+});
+
+test("KiroExecutor.transformEventStreamToSSE expands Kiro batch read into Claude tool calls", async () => {
+  const executor = new KiroExecutor();
+  const response = buildEventStreamResponse([
+    buildEventFrame("toolUseEvent", {
+      toolUseId: "tool_read_batch",
+      name: "read",
+      input: {
+        operations: [
+          { path: "D:\\repo\\a.ts", mode: "Line", offset: 1, limit: 2 },
+          { path: "D:\\repo\\b.ts", mode: "Line" },
+          { path: "D:\\repo\\src", mode: "Directory" },
+        ],
+      },
+    }),
+    buildEventFrame("messageStopEvent", {}),
+  ]);
+
+  const transformed = executor.transformEventStreamToSSE(response, "kiro-model");
+  const text = await transformed.text();
+  const toolCalls = parseSSEJsonChunks(text).flatMap(
+    (chunk) => chunk.choices?.[0]?.delta?.tool_calls || []
+  );
+
+  assert.equal(toolCalls.length, 3);
+  assert.deepEqual(
+    toolCalls.map((toolCall) => toolCall.id),
+    ["tool_read_batch_0", "tool_read_batch_1", "tool_read_batch_2"]
+  );
+  assert.deepEqual(
+    toolCalls.map((toolCall) => toolCall.function.name),
+    ["Read", "Read", "Glob"]
+  );
+  assert.equal(
+    toolCalls[0].function.arguments,
+    JSON.stringify({ file_path: "D:\\repo\\a.ts", offset: 1, limit: 2 })
+  );
+  assert.equal(toolCalls[1].function.arguments, JSON.stringify({ file_path: "D:\\repo\\b.ts" }));
+  assert.equal(
+    toolCalls[2].function.arguments,
+    JSON.stringify({ pattern: "*", path: "D:\\repo\\src" })
+  );
+  assert.match(text, /"finish_reason":"tool_calls"/);
+  assert.doesNotMatch(text, /"arguments":""/);
+});
+
+test("KiroExecutor.transformEventStreamToSSE maps Kiro code tool to executable Claude tool", async () => {
+  const executor = new KiroExecutor();
+  const response = buildEventStreamResponse([
+    buildEventFrame("toolUseEvent", {
+      toolUseId: "tool_code",
+      name: "code",
+      input: { operation: "get_document_symbols", file_path: "D:\\repo\\src\\index.ts" },
+    }),
+    buildEventFrame("messageStopEvent", {}),
+  ]);
+
+  const transformed = executor.transformEventStreamToSSE(response, "kiro-model");
+  const text = await transformed.text();
+  const toolCall = parseSSEJsonChunks(text).find((chunk) => chunk.choices?.[0]?.delta?.tool_calls)
+    .choices[0].delta.tool_calls[0];
+
+  assert.equal(toolCall.function.name, "Read");
+  assert.equal(
+    toolCall.function.arguments,
+    JSON.stringify({ file_path: "D:\\repo\\src\\index.ts" })
+  );
+  assert.match(text, /"finish_reason":"tool_calls"/);
+});
+
+test("KiroExecutor.transformEventStreamToSSE emits tool_calls finish on messageStopEvent", async () => {
+  const executor = new KiroExecutor();
+  const response = buildEventStreamResponse([
+    buildEventFrame("toolUseEvent", {
+      toolUseId: "tool_read_stop",
+      name: "read",
+      input: { operations: [{ path: "D:\\repo\\file.ts", mode: "Line" }] },
+    }),
+    buildEventFrame("messageStopEvent", {}),
+    buildEventFrame("metricsEvent", { inputTokens: 5, outputTokens: 1 }),
+  ]);
+
+  const transformed = executor.transformEventStreamToSSE(response, "kiro-model");
+  const text = await transformed.text();
+  const chunks = parseSSEJsonChunks(text);
+  const toolIndex = chunks.findIndex((chunk) => chunk.choices?.[0]?.delta?.tool_calls);
+  const finishIndex = chunks.findIndex(
+    (chunk) => chunk.choices?.[0]?.finish_reason === "tool_calls"
+  );
+
+  assert.ok(toolIndex >= 0);
+  assert.ok(finishIndex > toolIndex);
+  assert.equal(
+    chunks.filter((chunk) => chunk.choices?.[0]?.finish_reason === "tool_calls").length,
+    1
+  );
+  assert.ok(text.indexOf('"finish_reason":"tool_calls"') < text.indexOf("data: [DONE]"));
+  assert.equal(text.match(/data: \[DONE\]/g)?.length, 1);
+  assert.doesNotMatch(text, /"prompt_tokens":5/);
 });
 
 test("KiroExecutor.transformEventStreamToSSE parses fragmented frames and waits for post-stop usage", async () => {
@@ -235,6 +431,26 @@ test("KiroExecutor.transformEventStreamToSSE parses fragmented frames and waits 
     total_tokens: 24,
   });
   assert.match(text, /\[DONE\]/);
+});
+
+test("KiroExecutor.transformEventStreamToSSE estimates prompt tokens when metrics omit input", async () => {
+  const executor = new KiroExecutor();
+  const response = buildEventStreamResponse([
+    buildEventFrame("assistantResponseEvent", { content: "Hello estimated tokens" }),
+    buildEventFrame("messageStopEvent", {}),
+  ]);
+
+  const transformed = executor.transformEventStreamToSSE(response, "kiro-model", undefined, 25);
+  const text = await transformed.text();
+  const chunks = parseSSEJsonChunks(text);
+  const finishChunk = chunks.find((chunk) => chunk.choices?.[0]?.finish_reason);
+
+  assert.equal(finishChunk.usage.prompt_tokens, 25);
+  assert.ok(finishChunk.usage.completion_tokens > 0);
+  assert.equal(
+    finishChunk.usage.total_tokens,
+    finishChunk.usage.prompt_tokens + finishChunk.usage.completion_tokens
+  );
 });
 
 test("KiroExecutor.transformEventStreamToSSE parses one-byte fragmented frames", async () => {
